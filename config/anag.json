@@ -1,0 +1,50 @@
+{
+  "_comment": "Ticker universe mapping for IB and Bloomberg providers",
+  "_format": {
+    "TICKER": {
+      "name": "Company/Asset Name",
+      "ib_ticker": "Interactive Brokers ticker symbol",
+      "bbg_ticker": "Bloomberg ticker symbol (e.g., 'AAPL US Equity')",
+      "exchange": "Exchange code (e.g., 'NASDAQ', 'NYSE')",
+      "currency": "Currency code (e.g., 'USD', 'EUR')",
+      "asset_type": "Asset type (e.g., 'EQUITY', 'FUTURE', 'OPTION')",
+      "last_updated": "ISO date string (YYYY-MM-DD)"
+    }
+  },
+  "AAPL": {
+    "name": "Apple Inc.",
+    "ib_ticker": "AAPL",
+    "bbg_ticker": "AAPL US Equity",
+    "exchange": "NASDAQ",
+    "currency": "USD",
+    "asset_type": "EQUITY",
+    "last_updated": "2025-01-27"
+  },
+  "SPY": {
+    "ib_ticker": "SPY",
+    "bbg_ticker": null,
+    "name": "SPDR S&P 500 ETF TRUST",
+    "exchange": "SMART",
+    "currency": "USD",
+    "asset_type": "STK",
+    "last_updated": "2026-01-27"
+  },
+  "TSLA": {
+    "ib_ticker": "TSLA",
+    "bbg_ticker": null,
+    "name": null,
+    "exchange": null,
+    "currency": null,
+    "asset_type": null,
+    "last_updated": "2026-01-30"
+  },
+  "SX5E": {
+    "ib_ticker": null,
+    "bbg_ticker": "SX5E Index",
+    "name": null,
+    "exchange": null,
+    "currency": null,
+    "asset_type": null,
+    "last_updated": "2026-01-30"
+  }
+}
