@@ -14,8 +14,8 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# Data directory
-DATA_DIR = Path("database")
+# Data directory - sempre nella root del progetto
+DATA_DIR = Path(__file__).parent.parent.parent / "database"
 DATA_DIR.mkdir(exist_ok=True)
 
 
