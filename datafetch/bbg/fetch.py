@@ -104,7 +104,7 @@ class HistoricalDataFetcher:
                 # EOD data using bdh (bar data historical)
                 df = blp.bdh(
                     tickers=symbol,
-                    flds=['open', 'high', 'low', 'close', 'volume'],
+                    flds=['open', 'high', 'low', 'px_last', 'volume'],
                     start_date=start_str,
                     end_date=end_str
                 )

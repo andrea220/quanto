@@ -6,3 +6,5 @@ pyarrow>=10.0.0
 pytest>=7.0.0
 xbbg>=0.3.0
 polars>=0.20.0
+openpyxl>=3.0.0
+xlsxwriter>=3.0.0
