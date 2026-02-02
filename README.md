@@ -1,10 +1,3 @@
-# TBD
-
-- Rivedere anagrafica
-- Rivedere funzioni di download da BBG
-- Allineare download da IB
-
-
 # Business Requirements (BRD) — AlgoTrading Library
 **Ambito:** trading sistematico **intraday + medio termine**.
 **Obiettivo:** creare una piattaforma/libreria che renda **riproducibile, validabile e governabile** il ciclo **Research → Backtest → Paper → Live**, applicando best practice econometria+AI (es. López de Prado: data structures, labeling, sample weights, purged CV/CPCV, bet sizing, backtest pitfalls).
