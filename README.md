@@ -300,7 +300,7 @@ Supportare un setup in cui:
 **Obiettivo:** rendere coerenti anagrafica e data ingestion (BBG + IB) per evitare incoerenze a valle.
 
 - [x] Rivedere anagrafica strumenti (mapping univoco: ticker/vendor/IB, currency, exchange, contract specs)
-- [ ] Rivedere funzioni di download da BBG (schema, timezone, calendario, corporate actions, revision policy)
+- [x] Rivedere funzioni di download da BBG (schema, timezone, calendario, corporate actions, revision policy)
 - [ ] Allineare download da IB (stesso schema di output, stessi identificativi, stessa granularità)
 - [ ] Definire “Data Contract” minimo:
   - timestamp policy (UTC vs local), sessioni, timezone

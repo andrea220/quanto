@@ -1,3 +1,3 @@
 """
-Test suite for quanto data fetching system.
+Test suite for quanto.
 """

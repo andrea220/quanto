@@ -202,6 +202,18 @@ class TickerManager:
         universe = self.load_universe()
         return universe.get(ticker)
     
+    def get_anag(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """
+        Get anagrafica (ticker information) for a specific ticker.
+        
+        Args:
+            ticker: Ticker symbol to retrieve
+            
+        Returns:
+            dict: Anagrafica dictionary with ticker information, or None if not found
+        """
+        return self.get_ticker(ticker)
+    
     def list_tickers(self) -> List[str]:
         """
         List all tickers in the universe.
@@ -231,26 +243,16 @@ class TickerManager:
         self.save_universe(universe)
         logger.info(f"Removed ticker {ticker} from universe")
     
-    def validate_ticker(self, ticker: str, provider: str = "ib") -> bool:
+    def validate_ticker(self, ticker: str) -> bool:
         """
-        Validate ticker format for a specific provider.
+        Validate if ticker exists in the universe.
         
         Args:
             ticker: Ticker symbol to validate
-            provider: Provider name ('ib' or 'bbg')
             
         Returns:
-            bool: True if ticker format is valid
+            bool: True if ticker exists in universe, False otherwise
         """
-        ticker = ticker.strip()
-        
-        if provider.lower() == "ib":
-            # IB tickers are typically alphanumeric, no spaces
-            return bool(ticker and ticker.replace('_', '').replace('-', '').isalnum())
-        elif provider.lower() == "bbg":
-            # Bloomberg tickers typically have format: SYMBOL EXCHANGE TYPE
-            # e.g., "AAPL US Equity", "ES1 Index"
-            return bool(ticker and len(ticker.split()) >= 2)
-        else:
-            logger.warning(f"Unknown provider: {provider}")
-            return False
+        ticker = ticker.upper().strip()
+        universe = self.load_universe()
+        return ticker in universe
