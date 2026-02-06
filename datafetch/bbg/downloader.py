@@ -559,7 +559,7 @@ class BloombergDataDownloader:
                 f"Ticker {ticker} already exists. Use update_ticker() to update existing data."
             )
         
-        end_date = datetime.now().date()
+        end_date = datetime.now().date() - timedelta(days=1)
         start_date = end_date - timedelta(days=20*365)
         
         anag = self.ticker_manager.get_anag(ticker)
@@ -643,7 +643,7 @@ class BloombergDataDownloader:
         logger.info(f"Updating data for existing ticker: {ticker} (Bloomberg: {bbg_ticker})")
         
         ticker_dir = self._get_ticker_directory(ticker)
-        end_date = datetime.now().date()
+        end_date = datetime.now().date() - timedelta(days=1)
         
         # Get last saved date for EOD data
         last_date_eod = self._get_last_saved_date(ticker_dir, data_type='eod')

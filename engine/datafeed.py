@@ -298,23 +298,6 @@ class MarketData:
         current_timestamp: Tuple (date, time) representing the current bar.
             If None, uses the last row in the DataFrame as current.
         _ticker_cache: Internal cache for filtered ticker data (performance optimization)
-    
-    Examples:
-        >>> # Get current price
-        >>> market_data.price("SPY", "close")
-        450.25
-        
-        >>> # Get price 1 bar ago (T-1)
-        >>> market_data.price("SPY", "close", 1)
-        449.80
-        
-        >>> # Get last 100 prices (using slice notation :100)
-        >>> market_data.price("SPY", "close", slice(None, 100))
-        <polars.Series>
-        
-        >>> # Get prices from T-10 to T-1
-        >>> market_data.price("SPY", "close", slice(1, 11))
-        <polars.Series>
     """
     data: pl.DataFrame
     current_timestamp: Optional[tuple] = None

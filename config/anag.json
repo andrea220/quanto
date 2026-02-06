@@ -9,5 +9,16 @@
     "country": "EU",
     "sector": null,
     "industry": null
+  },
+  "SPY": {
+    "ib_ticker": null,
+    "bbg_ticker": "SPY US Equity",
+    "name": "S&P500 ETF",
+    "exchange": "NYSE ARCA",
+    "currency": "USD",
+    "asset_type": "ETF",
+    "country": "US",
+    "sector": null,
+    "industry": null
   }
 }
