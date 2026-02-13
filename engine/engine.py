@@ -100,9 +100,22 @@ class Researcher:
                 df = df.slice(first_valid_idx, df.height - first_valid_idx)
         
         # Cache the result
-        self._data_cache = df
+        # self._data_cache = df
         return df
     
+    def get_data_eod(self) -> Optional[pl.DataFrame]:
+       
+        # Load all data at once
+        df = self.feed.scan_prices(
+            self.start_date, 
+            self.end_date, 
+            'eod', 
+            self.tickers
+        ).collect(engine="streaming")
+        
+        if df.height == 0:
+            return None
+        return df
     def plot(
         self,
         ticker: Optional[str] = None,
@@ -237,6 +250,12 @@ class Strategy(ABC):
             return {"error": "Reporter not initialized"}
         return self.reporter.get_log_summary()
 
+    def _get_timestamp_str(self) -> str:
+        """Get current timestamp as string for logging."""
+        if hasattr(self, 'current_date') and hasattr(self, 'current_time') and self.current_date and self.current_time:
+            return f" @ {self.current_date} {self.current_time}"
+        return ""
+
     def _get_last_date(self, start_date: str, end_date: str, frequency: str, tickers: List[str]):
         lf = self.feed.scan_prices(start_date, end_date, frequency, tickers)
         y = end_date[:4]
@@ -322,22 +341,25 @@ class Strategy(ABC):
         total_pnl = total_balance - self.starting_balance
         pnl_pct = (total_pnl / self.starting_balance) * 100
         
+        timestamp_str = f" @ {self.current_date} {self.current_time}" if hasattr(self, 'current_date') and hasattr(self, 'current_time') else ""
         self.reporter.logger.info("-" * 60)
-        self.reporter.logger.info(f"BACKTEST COMPLETED on {self.current_date}")
+        self.reporter.logger.info(f"BACKTEST COMPLETED on {self.current_date}{timestamp_str}")
         self.reporter.logger.info("-" * 60)
-        self.reporter.logger.info(f"Final Balance: ${total_balance:,.2f}")
-        self.reporter.logger.info(f"Total P&L: ${total_pnl:,.2f} ({pnl_pct:+.2f}%)")
+        self.reporter.logger.info(f"Final Balance: ${total_balance:,.2f}" + timestamp_str)
+        self.reporter.logger.info(f"Total P&L: ${total_pnl:,.2f} ({pnl_pct:+.2f}%)" + timestamp_str)
         total_trades = len(self.positions_summary['entry_time'].unique()) if not self.positions_summary.empty else 0
-        self.reporter.logger.info(f"Total Trades: {total_trades}")
+        self.reporter.logger.info(f"Total Trades: {total_trades}" + timestamp_str)
         self.reporter.logger.info("=" * 60)
     
     def submit_order(self, ticker: str, side: PositionType, qty: float, order_type: OrderType = OrderType.MKT, limit_price: Optional[float] = None):
         """Submit an order to the execution model - con logging automatico."""
         # Log automatico ordine
+        timestamp_str = self._get_timestamp_str()
         self.reporter.logger.info(
             f"ORDER SUBMITTED → {ticker} | {side.name} {qty:.0f} shares | "
             f"Type: {order_type.value.upper()}"
             + (f" @ ${limit_price:.2f}" if limit_price else "")
+            + timestamp_str
         )
         
         order = Order(
@@ -438,8 +460,10 @@ class Strategy(ABC):
                     # Update remaining quantity to close
                     remaining_quantity -= quantity_from_position
             
+            timestamp_str = self._get_timestamp_str()
             self.reporter.logger.info(
                 f"CLOSED OPPOSITE POSITIONS → {ticker} | {opposite_side.name} {actual_quantity_to_close:.0f} shares"
+                + timestamp_str
             )
         
         # Return remaining quantity to open as new trade
@@ -505,7 +529,8 @@ class Strategy(ABC):
         if not orders:
             return
         
-        self.reporter.logger.info(f"SUBMITTING {len(orders)} ORDERS:")
+        timestamp_str = self._get_timestamp_str()
+        self.reporter.logger.info(f"SUBMITTING {len(orders)} ORDERS:" + timestamp_str)
         for order in orders:
             self.reporter.logger.info(
                 f"  → {order.ticker} | {order.side.name} {order.qty:.0f} shares"
@@ -527,7 +552,8 @@ class Strategy(ABC):
         # Track signal as closed (0)
         self._update_signal(ticker, 0)
         # Log
-        self.reporter.logger.info(f"POSITION CLOSED → {ticker}")
+        timestamp_str = self._get_timestamp_str()
+        self.reporter.logger.info(f"POSITION CLOSED → {ticker}" + timestamp_str)
     
     def close_all_positions(self):
         """Close all open positions and track signals."""
@@ -546,7 +572,8 @@ class Strategy(ABC):
         
         # Log
         if open_tickers:
-            self.reporter.logger.info(f"ALL POSITIONS CLOSED → {', '.join(open_tickers)}")
+            timestamp_str = self._get_timestamp_str()
+            self.reporter.logger.info(f"ALL POSITIONS CLOSED → {', '.join(open_tickers)}" + timestamp_str)
     
     def get_bar(self, ticker: str) -> Optional[pl.DataFrame]:
         """Get the current bar data for a specific ticker using MarketData."""
@@ -603,9 +630,11 @@ class Strategy(ABC):
         for fill in fills:
             # Log automatico fill
             notional = fill.qty * fill.price
+            timestamp_str = self._get_timestamp_str()
             self.reporter.logger.info(
                 f"ORDER FILLED → {fill.ticker} | {fill.side.name} {fill.qty:.0f} @ ${fill.price:.2f} | "
                 f"Notional: ${notional:,.2f}"
+                + timestamp_str
             )
             
             # Calculate entry costs
@@ -640,7 +669,8 @@ class Strategy(ABC):
             return
         
         n_pending = len(self.exec._pending)
-        self.reporter.logger.debug(f"Executing {n_pending} pending orders...")
+        timestamp_str = self._get_timestamp_str()
+        self.reporter.logger.debug(f"Executing {n_pending} pending orders..." + timestamp_str)
         
         # Use current MarketData directly - get_current_bar() provides current bar data
         # ExecutionModel needs price_map format, which we create from MarketData
@@ -713,15 +743,16 @@ class Strategy(ABC):
                 self.execute_pending_orders()
             
             # Update portfolio summary and balance
-            if self.market_data:
-                summary = pd.DataFrame(self.portfolio.get_positions_summary(self.market_data))
-                self.positions_summary = pd.concat([self.positions_summary, summary], axis = 0) 
-                if summary.empty:
-                    pnl = 0
-                else:
-                    pnl = summary['global_pnl'].sum()
-            else:
+            # if self.market_data:
+            summary = pd.DataFrame(self.portfolio.get_positions_summary(self.market_data)) # qua si può mettere in modo che refreshi solo le posizioni aperte
+            self.positions_summary = pd.concat([self.positions_summary, summary], axis = 0) # e poi calcoli il pnl chiuso sulla lista di operazioni chiuse
+            # salvanddo in concat solo gli eventi, quindi per ogni posizione la data di entrata e eventualmente uscita, nel mezzo niente
+            if summary.empty:
                 pnl = 0
+            else:
+                pnl = summary['global_pnl'].sum()
+            # else:
+            #     pnl = 0
             
             # Update balance DataFrame with current date, time and balance
             total_balance = self.starting_balance + pnl 
@@ -733,8 +764,123 @@ class Strategy(ABC):
             self.balance = pl.concat([self.balance, new_balance_row])
             self.period += 1
 
+    def backtest_refactor(self,
+                 starting_balance: float,
+                 start_date: str,
+                 end_date: str,
+                 frequency: str,
+                 tickers: List[str],
+                 feed: DataFeed, 
+                 exec_model: Optional[ExecutionModel] = None,
+                 risk: Optional[RiskManager] = None,
+                 reporter: Optional[ReportWriter] = None,
+                 intraday_log = False):
 
-        
+        researcher = Researcher(self.factors, feed, start_date, end_date, frequency, tickers)
+        self.on_start(start_date, end_date, frequency, tickers, starting_balance, feed, exec_model, risk, reporter)
+
+        data = researcher.get_data()
+        data_eod = researcher.get_data_eod()
+        if data is None:
+            return
+
+        # Get unique dates and times
+        unique_dates = data['date'].unique().sort()
+        self.period = 0 
+
+        # Initialize balance with initial balance at first timestamp
+        if len(unique_dates) > 0:
+            first_date = unique_dates[0]
+            first_times = data.filter(pl.col("date") == first_date)['time'].unique().sort()
+            if len(first_times) > 0:
+                first_time = first_times[0]
+                initial_balance_row = pl.DataFrame({
+                    "date": [first_date],
+                    "time": [first_time],
+                    "balance": [starting_balance]
+                })
+                self.balance = pl.concat([self.balance, initial_balance_row])
+
+        for current_date in unique_dates:
+            # Get unique times for current date
+            times_for_date = data.filter(pl.col("date") == current_date)['time'].unique().sort()
+
+            # Get EOD data from previous day only (not current day)
+            self.history_eod = data_eod.filter(pl.col("date") < current_date)
+            
+            # Find the last available date before current_date
+            if len(self.history_eod) > 0:
+                prev_date_eod = self.history_eod['date'].max()
+                times_eod = self.history_eod.filter(pl.col("date") == prev_date_eod)['time'].unique().sort()
+                self.market_data_prev_eod = MarketData.from_dataframe(
+                        self.history_eod,
+                        current_timestamp=(prev_date_eod, times_eod.item())
+                    )
+            else:
+                # No previous EOD data available
+                self.market_data_prev_eod = None
+                self.prev_bar_eod = None
+
+            for current_time in times_for_date:
+                self.history = data.filter(
+                    (pl.col("date") <= current_date) |
+                    ((pl.col("date") == current_date) & (pl.col("time") <= current_time))
+                )
+
+                # Create MarketData directly
+                self.market_data = MarketData.from_dataframe(
+                                    self.history,
+                                    current_timestamp=(current_date, current_time)
+                                )
+                self.current_date, self.current_time = self.market_data.current_timestamp
+                self.current_bar = self.market_data.get_current_bar()
+                if self.market_data_prev_eod:
+                    self.prev_bar_eod = self.market_data_prev_eod.get_current_bar()
+
+                # Check if this is the last bar
+                if self.current_date == self.last_date and self.current_time == self.last_time:
+                    self.on_end()
+                    break
+                
+                # Execute pending orders from previous bar (for "next_open" mode)
+                if self.exec.mode == "next_open":
+                    self.execute_pending_orders()
+                
+                # Let strategy generate new orders
+                self.on_bar()
+                
+                # Execute orders immediately if in "on_close" mode
+                if self.exec.mode == "on_close":
+                    self.execute_pending_orders()
+
+                # Update portfolio summary and balance
+                summary = pd.DataFrame(self.portfolio.get_positions_summary(self.market_data))
+                if summary.empty:
+                    pnl = 0
+                else:
+                    pnl = summary['global_pnl'].sum()
+                total_balance = self.starting_balance + pnl 
+
+                if intraday_log:
+                    self.positions_summary = pd.concat([self.positions_summary, summary], axis = 0)
+                    new_balance_row = pl.DataFrame({
+                            "date": [self.current_date],
+                            "time": [self.current_time],
+                            "balance": [total_balance]
+                        })
+                    self.balance = pl.concat([self.balance, new_balance_row])
+                self.period += 1
+
+
+            if not intraday_log:
+                self.positions_summary = pd.concat([self.positions_summary, summary], axis = 0)
+                new_balance_row = pl.DataFrame({
+                        "date": [self.current_date],
+                        "time": [self.current_time],
+                        "balance": [total_balance]
+                    })
+                self.balance = pl.concat([self.balance, new_balance_row])
+      
 class Clock:
     """Clock for iterating through bars in temporal order."""
     

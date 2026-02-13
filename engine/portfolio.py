@@ -240,6 +240,7 @@ class Portfolio:
                 "ref_time": ref_time,
                 "entry_time": str(position.entry_time),
                 "symbol": position.symbol,
+                "trade_id": position.trade_id,
                 "type": position.asset_type.value,
                 "side": position.position_type.value,
                 "quantity": position.quantity,

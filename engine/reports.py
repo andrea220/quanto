@@ -35,9 +35,11 @@ class StrategyAnalytics:
                 'daily_equity': []
             })
         else:
-            self.daily_equity = self.strategy.positions_summary.groupby('ref_date')['global_pnl'].sum().reset_index() 
-            self.daily_equity = self.daily_equity.rename(columns={'global_pnl': 'daily_equity'})
-            self.daily_equity['daily_equity'] = self.daily_equity['daily_equity'] + self.strategy.starting_balance
+            balance_df = self.strategy.balance.group_by('date').last()
+            first_row = self.strategy.balance.head(1)
+            balance_df = pl.concat([first_row, balance_df])
+            self.daily_equity = balance_df.to_pandas().rename(columns={'date': 'ref_date', 'balance': 'daily_equity'})
+
 
 
     def plot_balance(self, benchmark=None):
