@@ -1,0 +1,112 @@
+---
+description: Architecture and conventions of the quanto library (research + backtest)
+alwaysApply: false
+---
+
+# Quanto – General Architecture
+
+## Main modules (`engine/`)
+
+| File | Contents |
+|------|----------|
+| `datafeed.py` | `DataFeed` (parquet I/O) + `MarketData` (bar-by-bar access in backtest) |
+| `factor.py` | `PlotConfig`, `RenderInstruction`, `Factor` ABC + all concrete factors |
+| `engine.py` | `Researcher` (research/plotting) + `Strategy` ABC (event-driven backtest) |
+| `plotting.py` | `Plotter`, `PlotRequest`, `plot_timeseries()` |
+| `portfolio.py` | `Portfolio`, `Position`, `AssetType`, `PositionType` |
+| `execution.py` | `ExecutionModel`, `Order`, `Fill`, `OrderType` |
+| `risk.py` | `RiskManager` |
+| `reports.py` | `ReportWriter` (logging) |
+
+## Data
+
+- Parquet files at `database/<ticker>/<year>.parquet`
+- Columns: `date, time, ticker, open, high, low, close, volume, type`
+- `type` = `"eod"` or `"intraday"`
+- **EOD**: `time_col == 'date'`
+- **Intraday**: `time_col == 'timestamp'` (synthetic `date+time` column); original `date` and `time` columns are preserved in the DataFrame
+
+## Researcher (research)
+
+```python
+researcher = Researcher(factors, feed, start_date, end_date, frequency, tickers)
+df = researcher.get_data()          # LazyFrame → compute factors → strip warmup rows
+fig = researcher.plot(
+    chart_type='candlestick',       # 'line' | 'candlestick'
+    start_date='2026-03-01',        # filter visible range (optional)
+    end_date='2026-03-15',
+    show_eod=True,                  # vertical lines at session open (intraday only)
+)
+```
+
+## Factor – how to create a new one
+
+```python
+class MyFactor(Factor):
+    _static_name = "my"
+
+    def __init__(self, window: int, plot_config=None):
+        self.window = window
+        if plot_config is None:
+            plot_config = PlotConfig(panel='price', plot_type='lines')
+        super().__init__(plot_config=plot_config)
+
+    def _build_name(self) -> str:
+        return f"{self._static_name}_{self.window}"
+
+    def compute(self, df: pl.DataFrame) -> pl.DataFrame:
+        return df.with_columns(
+            pl.col("close").rolling_mean(self.window).over("ticker").alias(self.name)
+        )
+
+    def warmup(self) -> int:
+        return self.window
+
+    def get_column_names(self) -> List[str]:        # override if multi-column output
+        return [self.name]
+
+    def get_render_instructions(self) -> List[RenderInstruction]:   # override for zones/markers
+        ...
+```
+
+- Always use `.over("ticker")` for multi-ticker support
+- Column naming convention: `{factor_name}_{description}` (e.g. `pdl_hod_top`)
+
+## plot_type values
+
+| Value | Use |
+|-------|-----|
+| `'lines'` / `'lines+markers'` | Time series line |
+| `'markers'` | Scatter (swing highs/lows, signals) |
+| `'zone'` | `column_names = [top_col, btm_col]` – filled area between two series |
+| `'vlines'` | Vertical lines for each non-zero value (positive=green, negative=red) |
+
+## Zones (`plot_type='zone'`)
+
+- `column_names` must always be pairs `[top, btm]`
+- `color` = border color, `fill_color` = rgba fill color
+- If different zones need different colors (e.g. HoD/LoD) → override `get_render_instructions()` with one `RenderInstruction` per zone
+
+## Override style on the fly (without touching the factor)
+
+```python
+from engine.plotting import PlotRequest
+researcher.plot(plot_factors=[
+    PlotRequest("pdl_hod", fill_color="rgba(220,50,50,0.3)"),
+    PlotRequest("pdl_lod", color="#00AA44"),
+])
+```
+
+## Existing concrete factors
+
+`MovingAverage`, `Return`, `Momentum`, `DonchianChannels`, `ATR`,
+`SwingHighLow`, `FairValueGap`, `OrderBlock`, `BuySellLiquidity`,
+`MarketStructure`, `PrevDayHighLow`
+
+## TODO – to be detailed
+
+- [ ] `Strategy` ABC: lifecycle (`on_start`, `on_bar`, `on_end`), `submit_order`, `close_positions`
+- [ ] `Portfolio` / `Position`: PnL management, `AssetType`, `PositionType`
+- [ ] `ExecutionModel`: `on_close` / `on_open` modes, slippage/commission bps
+- [ ] `RiskManager`: parameters and hooks
+- [ ] `DataFeed`: supported frequencies, ticker naming conventions

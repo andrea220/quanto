@@ -8,460 +8,645 @@ Supports Polars DataFrames with OHLCV data and custom factors/indicators.
 import polars as pl
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from typing import List, Optional, Union, TYPE_CHECKING
+from typing import List, Optional, Union, Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .factor import Factor
+    from .factor import Factor, RenderInstruction
     from .engine import Researcher
+
+
+class PlotRequest:
+    """
+    Riferimento a un factor (per nome/colonna o istanza) con override opzionali di stile.
+
+    Passare a ``researcher.plot(plot_factors=[...])`` in alternativa a stringhe semplici
+    quando si vogliono sovrascrivere colore, opacità, ecc. al volo.
+
+    Parametri
+    ---------
+    ref : str | Factor
+        Nome del factor (es. ``"pdl"``), nome di una colonna (es. ``"pdl_hod_top"``),
+        o istanza di Factor.
+    **style_overrides
+        Qualunque campo di ``RenderInstruction`` da sovrascrivere
+        (es. ``color``, ``fill_color``, ``opacity``, ``line_width``).
+
+    Esempi
+    ------
+    >>> PlotRequest("pdl")                              # config di default
+    >>> PlotRequest("pdl", fill_color="rgba(255,0,0,0.2)")
+    >>> PlotRequest("ms_5_swing_high", color="#FF6600")
+    >>> PlotRequest(PrevDayHighLow(), opacity=0.5)
+    """
+    def __init__(self, ref: Union[str, 'Factor'], **style_overrides):
+        self.ref       = ref
+        self.overrides = style_overrides
 
 
 class Plotter:
     """
-    A class for creating financial charts with price data and indicators.
-    
-    Can be initialized with either a Researcher object (recommended) or a DataFrame.
-    
-    Parameters:
-    -----------
-    researcher : Researcher, optional
-        Researcher object containing factors and data. If provided, automatically
-        uses factors and their plot configurations.
-    df : pl.DataFrame, optional
-        Polars DataFrame containing financial data with columns:
-        - date or timestamp: datetime column
-        - ticker: security identifier
-        - close: closing prices
-        - open, high, low, volume (optional, for future candlestick support)
-        Required if researcher is not provided.
-    ticker : str, optional
-        Specific ticker to plot. If None and df contains multiple tickers,
-        will plot the first ticker found. Ignored if researcher is provided.
+    Crea grafici finanziari interattivi con prezzi e indicatori.
+
+    Può essere inizializzato con un ``Researcher`` (consigliato) o un DataFrame raw.
+
+    Il flusso di rendering è:
+
+        plot_factors items
+            ↓  _resolve()
+        List[RenderInstruction]          ← sorgente unica di verità per lo stile
+            ↓  _render()  (dispatch)
+        _render_lines / _render_markers / _render_zone / _render_vlines
     """
-    
+
+    # ── Palette di fallback per colonne senza colore esplicito ─────────────
+    _FALLBACK_COLORS: List[str] = [
+        '#A23B72', '#F18F01', '#C73E1D', '#6A994E',
+        '#BC4B51', '#5E548E', '#E07A5F', '#3D5A80',
+    ]
+    _MULTI_COLORS: Dict[str, str] = {
+        'upper':  '#26A69A',
+        'lower':  '#EF5350',
+        'middle': '#FFA726',
+    }
+    _DASH_MAP: Dict[str, str] = {
+        'solid': 'solid', 'dash': 'dash', 'dot': 'dot', 'dashdot': 'dashdot',
+    }
+
     def __init__(
-        self, 
+        self,
         researcher: Optional['Researcher'] = None,
-        df: Optional[pl.DataFrame] = None, 
-        ticker: Optional[str] = None
+        df: Optional[pl.DataFrame] = None,
+        ticker: Optional[str] = None,
     ):
         if researcher is not None:
-            # Initialize from Researcher
             self.researcher = researcher
-            self.factors = researcher.factors
-            self.df = researcher.get_data()
+            self.factors    = researcher.factors
+            self.df         = researcher.get_data()
             if self.df is None:
                 raise ValueError("Researcher returned no data")
-            
-            # Store default ticker (first from researcher's tickers list)
-            self.default_ticker = ticker if ticker is not None else (researcher.tickers[0] if researcher.tickers else None)
+            self.default_ticker = ticker if ticker is not None else (
+                researcher.tickers[0] if researcher.tickers else None
+            )
             if self.default_ticker and self.default_ticker not in researcher.tickers:
                 raise ValueError(f"Ticker '{self.default_ticker}' not in researcher's tickers list")
         elif df is not None:
-            # Initialize from DataFrame (backward compatibility)
-            self.researcher = None
-            self.factors = []
-            self.df = df
+            self.researcher     = None
+            self.factors        = []
+            self.df             = df
             self.default_ticker = ticker
         else:
             raise ValueError("Either 'researcher' or 'df' must be provided")
-        
-        # Identify the time column (either 'date' or 'timestamp')
+
+        # Identify time column
         self.time_col = None
         for col in ['date', 'timestamp', 'time']:
             if col in self.df.columns:
                 self.time_col = col
                 break
-        
         if self.time_col is None:
             raise ValueError("DataFrame must contain a 'date' or 'timestamp' column")
-        
-        # Check required columns
+
+        # For intraday: combine date+time into a timestamp column
+        if self.time_col == 'date' and 'time' in self.df.columns:
+            n_rows        = self.df.height
+            n_unique_dates = self.df.select(pl.col('date')).n_unique()
+            if n_rows > n_unique_dates:
+                self.df = self.df.with_columns(
+                    pl.datetime(
+                        year=pl.col('date').dt.year(),
+                        month=pl.col('date').dt.month(),
+                        day=pl.col('date').dt.day(),
+                        hour=pl.col('time').dt.hour(),
+                        minute=pl.col('time').dt.minute(),
+                        second=pl.col('time').dt.second(),
+                    ).alias('timestamp')
+                )
+                self.time_col = 'timestamp'
+
         if 'close' not in self.df.columns:
             raise ValueError("DataFrame must contain a 'close' column")
-    
+
+        # Build factor registry {name_or_col → Factor}
+        self._registry: Dict[str, 'Factor'] = self._build_registry()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Registry helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _build_registry(self) -> Dict[str, 'Factor']:
+        """
+        Costruisce un dizionario che mappa sia il nome del factor che ogni
+        colonna che produce → Factor.  Usato da ``_resolve``.
+        """
+        if self.researcher is None:
+            return {}
+        registry: Dict[str, 'Factor'] = {}
+        for f in self.factors:
+            registry[f.name] = f
+            for col in f.get_column_names():
+                registry[col] = f
+        return registry
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Resolve: item → List[RenderInstruction]
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _resolve(self, item) -> List['RenderInstruction']:
+        """
+        Converte un singolo elemento di ``plot_factors`` in una lista di
+        ``RenderInstruction``.
+
+        Tipi accettati
+        --------------
+        str         → cerca nel registry; se trovato usa Factor.get_render_instructions()
+                      filtrato sulla colonna specificata; altrimenti linea generica
+        Factor      → chiama direttamente get_render_instructions()
+        PlotRequest → come str/Factor ma applica gli override di stile in cima
+        """
+        from engine.factor import RenderInstruction
+
+        if isinstance(item, PlotRequest):
+            overrides = item.overrides
+            ref       = item.ref
+        else:
+            overrides = {}
+            ref       = item
+
+        if isinstance(ref, str):
+            factor = self._registry.get(ref)
+            if factor is None:
+                # Colonna non mappata a nessun factor → linea generica
+                instr = RenderInstruction(column_names=[ref], plot_type='lines')
+                instrs = [instr]
+            else:
+                all_instrs = factor.get_render_instructions()
+                if ref != factor.name:
+                    # ref è una colonna specifica → filtra solo l'istruzione che la contiene
+                    filtered = [i for i in all_instrs if ref in i.column_names]
+                    instrs = filtered if filtered else [
+                        # Colonna esiste nel factor ma non ha istruzione dedicata → linea generica
+                        RenderInstruction(column_names=[ref], plot_type='lines')
+                    ]
+                else:
+                    instrs = all_instrs
+        else:
+            # Factor instance
+            instrs = ref.get_render_instructions()
+
+        if overrides:
+            return [i.with_overrides(**overrides) for i in instrs]
+        return instrs
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Render dispatch + individual renderers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _render(
+        self,
+        fig: go.Figure,
+        df: pl.DataFrame,
+        time_data: pl.Series,
+        instr: 'RenderInstruction',
+        row: int,
+    ) -> None:
+        """Dispatch a RenderInstruction al renderer corretto in base a plot_type."""
+        pt = instr.plot_type
+        if pt == 'vlines':
+            self._render_vlines(fig, df, time_data, instr, row)
+        elif pt == 'zone':
+            self._render_zone(fig, df, time_data, instr, row)
+        elif pt == 'markers':
+            self._render_markers(fig, df, time_data, instr, row)
+        else:  # 'lines' o 'lines+markers'
+            self._render_lines(fig, df, time_data, instr, row)
+
+    def _add_trace(self, fig: go.Figure, trace, row: int) -> None:
+        """Helper: aggiunge una trace alla figura gestendo secondary_y solo per row==1."""
+        if row == 1:
+            fig.add_trace(trace, row=row, col=1, secondary_y=False)
+        else:
+            fig.add_trace(trace, row=row, col=1)
+
+    def _pick_color(self, instr: 'RenderInstruction', col: str) -> str:
+        """Restituisce il colore da usare per una colonna, con fallback intelligente."""
+        if instr.color is not None:
+            return instr.color
+        for suffix, c in self._MULTI_COLORS.items():
+            if f'_{suffix}' in col:
+                return c
+        return self._FALLBACK_COLORS[hash(col) % len(self._FALLBACK_COLORS)]
+
+    def _render_lines(
+        self,
+        fig: go.Figure,
+        df: pl.DataFrame,
+        time_data: pl.Series,
+        instr: 'RenderInstruction',
+        row: int,
+    ) -> None:
+        """Disegna una o più linee."""
+        for col in instr.column_names:
+            color = self._pick_color(instr, col)
+            label = instr.label or col
+            trace = go.Scatter(
+                x=time_data,
+                y=df.select(pl.col(col)).to_series(),
+                name=label,
+                mode=instr.plot_type,
+                opacity=instr.opacity,
+                showlegend=instr.show_in_legend,
+                line=dict(
+                    color=color,
+                    width=instr.line_width,
+                    dash=self._DASH_MAP.get(instr.line_style, 'solid'),
+                ),
+            )
+            self._add_trace(fig, trace, row)
+
+    def _render_markers(
+        self,
+        fig: go.Figure,
+        df: pl.DataFrame,
+        time_data: pl.Series,
+        instr: 'RenderInstruction',
+        row: int,
+    ) -> None:
+        """Disegna marker (triangoli per swing, cerchi per default)."""
+        for col in instr.column_names:
+            color = self._pick_color(instr, col)
+            label = instr.label or col
+            trace = go.Scatter(
+                x=time_data,
+                y=df.select(pl.col(col)).to_series(),
+                name=label,
+                mode='markers',
+                opacity=instr.opacity,
+                showlegend=instr.show_in_legend,
+                marker=dict(
+                    color=color,
+                    symbol=instr.marker_symbol,
+                    size=instr.marker_size,
+                    line=dict(color='rgba(0,0,0,0.4)', width=1),
+                ),
+            )
+            self._add_trace(fig, trace, row)
+
+    def _render_zone(
+        self,
+        fig: go.Figure,
+        df: pl.DataFrame,
+        time_data: pl.Series,
+        instr: 'RenderInstruction',
+        row: int,
+    ) -> None:
+        """
+        Disegna una banda riempita tra coppie di colonne (top, btm).
+        column_names deve essere pari: [top0, btm0, top1, btm1, …]
+        """
+        border_color = instr.color      or 'rgba(255,215,0,0.55)'
+        fill_color   = instr.fill_color or 'rgba(255,215,0,0.12)'
+
+        for i in range(0, len(instr.column_names) - 1, 2):
+            top_name = instr.column_names[i]
+            btm_name = instr.column_names[i + 1]
+            top_data = df.select(pl.col(top_name)).to_series()
+            btm_data = df.select(pl.col(btm_name)).to_series()
+            label    = instr.label or top_name.rsplit('_', 1)[0]
+
+            self._add_trace(fig, go.Scatter(
+                x=time_data, y=top_data,
+                mode='lines', fill=None,
+                line=dict(color=border_color, width=instr.line_width),
+                showlegend=False,
+                name=f'{label}_top',
+            ), row)
+            self._add_trace(fig, go.Scatter(
+                x=time_data, y=btm_data,
+                mode='lines', fill='tonexty', fillcolor=fill_color,
+                line=dict(color=border_color, width=instr.line_width),
+                showlegend=True,
+                name=label,
+            ), row)
+
+    def _render_vlines(
+        self,
+        fig: go.Figure,
+        df: pl.DataFrame,
+        time_data: pl.Series,
+        instr: 'RenderInstruction',
+        row: int,
+    ) -> None:
+        """
+        Disegna linee verticali per ogni evento non-zero nel segnale.
+        Aggiunge una trace invisibile alla legenda per colore pos/neg.
+        """
+        pos_color = instr.vline_positive_color
+        neg_color = instr.vline_negative_color
+        min_abs   = instr.vline_min_abs
+        vwidth    = instr.vline_width
+        vopacity  = instr.vline_opacity
+        yref      = 'y domain' if row == 1 else f'y{row} domain'
+
+        for col in instr.column_names:
+            values = df.select(pl.col(col)).to_series().to_list()
+            times  = time_data.to_list()
+            legend_shown = {'pos': False, 'neg': False}
+            base_label   = instr.label or col
+
+            for t, v in zip(times, values):
+                if v is None or v == 0 or abs(v) < min_abs:
+                    continue
+                color   = pos_color if v > 0 else neg_color
+                leg_key = 'pos' if v > 0 else 'neg'
+
+                if not legend_shown[leg_key]:
+                    legend_shown[leg_key] = True
+                    direction = '↑' if v > 0 else '↓'
+                    self._add_trace(fig, go.Scatter(
+                        x=[t], y=[None], mode='lines',
+                        name=f'{base_label} ({direction})',
+                        line=dict(color=color, width=vwidth),
+                        opacity=vopacity, showlegend=True,
+                    ), row)
+
+                fig.add_shape(
+                    type='line', xref='x', yref=yref,
+                    x0=t, x1=t, y0=0, y1=1,
+                    line=dict(color=color, width=vwidth),
+                    opacity=vopacity,
+                    row=row, col=1,
+                )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Main plot method
+    # ──────────────────────────────────────────────────────────────────────
+
     def plot(
-        self, 
-        ticker: Optional[str] = None,
-        plot_factors: Optional[List[Union[str, 'Factor']]] = None,
-        title: Optional[str] = None,
-        height: int = 600,
-        width: Optional[int] = None,
-        chart_type: str = 'line',
-        theme: str = 'plotly_white'
+        self,
+        ticker:       Optional[str]  = None,
+        plot_factors: Optional[List] = None,
+        title:        Optional[str]  = None,
+        height:       int            = 600,
+        width:        Optional[int]  = None,
+        chart_type:   str            = 'line',
+        theme:        str            = 'plotly_white',
+        start_date:   Optional[str]  = None,
+        end_date:     Optional[str]  = None,
+        show_eod:     bool           = False,
     ) -> go.Figure:
         """
-        Create an interactive plot with close price and optional indicators.
-        
-        Parameters:
+        Crea un grafico interattivo con prezzo e indicatori.
+
+        Parametri
+        ---------
+        ticker       : ticker da plottare (se None usa il primo disponibile)
+        plot_factors : lista di str | Factor | PlotRequest
+                       (se None usa tutti i factor del researcher)
+        title        : titolo del grafico
+        height/width : dimensioni in pixel
+        chart_type   : 'line' | 'candlestick'
+        theme        : template Plotly
+        start_date   : data di inizio del range da plottare (es. '2026-01-01'), opzionale
+        end_date     : data di fine del range da plottare (es. '2026-03-31'), opzionale
+        show_eod     : se True aggiunge una linea verticale alla fine di ogni giornata
+                       (solo per dati intraday)
+
+        Restituisce
         -----------
-        ticker : str, optional
-            Specific ticker to plot. If None, uses the default ticker from initialization
-            or the first ticker available in the data.
-        plot_factors : List[Union[str, Factor]], optional
-            List of factor names (strings) or Factor objects to plot.
-            If None and Plotter was initialized with Researcher, automatically
-            plots all factors from the researcher.
-            Factor objects automatically configure panel placement and styling.
-            Factors with panel='price' plot with price data (top panel).
-            Factors with panel='indicator' plot in separate subplot below.
-        title : str, optional
-            Chart title. Defaults to "{ticker} - Price and Indicators"
-        height : int, default=600
-            Height of the plot in pixels
-        width : int, optional
-            Width of the plot in pixels. If None, uses full width
-        chart_type : str, default='line'
-            Type of price chart: 'line' for line chart of close prices,
-            'candlestick' for OHLC candlestick chart
-        theme : str, default='plotly_white'
-            Plotly template theme
-        
-        Returns:
-        --------
         go.Figure
-            Plotly figure object that can be displayed with fig.show()
         """
-        # Determine which ticker to use
-        plot_ticker = ticker if ticker is not None else self.default_ticker
-        
-        # If still no ticker, try to get from data
+        from engine.factor import RenderInstruction
+
+        # ── 1. Ticker ────────────────────────────────────────────────────
+        plot_ticker = ticker or self.default_ticker
         if plot_ticker is None:
-            if 'ticker' in self.df.columns:
-                available_tickers = self.df.select(pl.col('ticker')).unique().to_series().to_list()
-                if available_tickers:
-                    plot_ticker = available_tickers[0]
-                else:
-                    plot_ticker = "Unknown"
-            else:
-                plot_ticker = "Unknown"
-        
-        # Validate ticker if researcher is used
+            avail = self.df['ticker'].unique().to_list() if 'ticker' in self.df.columns else []
+            plot_ticker = avail[0] if avail else "Unknown"
         if self.researcher is not None and plot_ticker not in self.researcher.tickers:
-            raise ValueError(f"Ticker '{plot_ticker}' not in researcher's tickers list: {self.researcher.tickers}")
-        
-        # Filter data by ticker
-        if 'ticker' in self.df.columns:
-            df_filtered = self.df.filter(pl.col('ticker') == plot_ticker)
-        else:
-            df_filtered = self.df
-        
-        # Sort by time
-        df_filtered = df_filtered.sort(self.time_col)
-        
-        # Auto-use factors from researcher if not specified
-        if plot_factors is None:
-            if self.researcher is not None:
-                plot_factors = self.factors
-            else:
-                plot_factors = []
-        
-        # Validate chart type
+            raise ValueError(
+                f"Ticker '{plot_ticker}' not in researcher's tickers: {self.researcher.tickers}"
+            )
+
+        # ── 2. Filtra e ordina i dati ─────────────────────────────────────
+        df = (
+            self.df.filter(pl.col('ticker') == plot_ticker)
+            if 'ticker' in self.df.columns else self.df
+        )
+        df = df.sort(self.time_col)
+
+        # Filtra per start_date / end_date se specificati
+        date_col = 'date' if 'date' in df.columns else (self.time_col if self.time_col != 'timestamp' else None)
+        if date_col is not None:
+            if start_date is not None:
+                sd = pl.lit(start_date).str.to_date()
+                df = df.filter(pl.col(date_col).cast(pl.Date) >= sd)
+            if end_date is not None:
+                ed = pl.lit(end_date).str.to_date()
+                df = df.filter(pl.col(date_col).cast(pl.Date) <= ed)
+        elif self.time_col == 'timestamp':
+            if start_date is not None:
+                sd = pl.lit(start_date).str.to_date()
+                df = df.filter(pl.col('timestamp').cast(pl.Date) >= sd)
+            if end_date is not None:
+                ed = pl.lit(end_date).str.to_date()
+                df = df.filter(pl.col('timestamp').cast(pl.Date) <= ed)
+
+        time_data = df.select(pl.col(self.time_col)).to_series()
+
+        # ── 3. Validazione chart_type ─────────────────────────────────────
         if chart_type not in ['line', 'candlestick']:
             raise ValueError("chart_type must be 'line' or 'candlestick'")
-        
-        # Check for OHLC columns if candlestick requested
         if chart_type == 'candlestick':
-            required_cols = ['open', 'high', 'low', 'close']
-            missing_cols = [col for col in required_cols if col not in self.df.columns]
-            if missing_cols:
-                raise ValueError(
-                    f"Candlestick chart requires OHLC columns. Missing: {missing_cols}"
-                )
-        
-        # Parse factors and organize by panel
-        price_panel_factors = []
-        indicator_panel_factors = []
-        
-        for factor in plot_factors:
-            factor_info = self._parse_factor(factor)
-            
-            # Validate all columns exist in dataframe
-            for col_name in factor_info['column_names']:
-                if col_name not in df_filtered.columns:
-                    raise ValueError(f"Factor column '{col_name}' not found in DataFrame")
-            
-            # Organize by panel
-            if factor_info['panel'] == 'price':
-                price_panel_factors.append(factor_info)
-            else:  # 'indicator'
-                indicator_panel_factors.append(factor_info)
-        
-        # Determine subplot configuration
-        # Each indicator factor gets its own panel
-        n_indicator_panels = len(indicator_panel_factors)
-        has_indicator_panel = n_indicator_panels > 0
-        n_rows = 1 + n_indicator_panels  # 1 for price + indicators
-        
-        # Set default title
+            missing = [c for c in ['open', 'high', 'low', 'close'] if c not in df.columns]
+            if missing:
+                raise ValueError(f"Candlestick requires OHLC columns. Missing: {missing}")
+
+        # ── 4. Risolvi le istruzioni di rendering ─────────────────────────
+        items = plot_factors if plot_factors is not None else (
+            self.factors if self.researcher else []
+        )
+        all_instrs: List[RenderInstruction] = []
+        for item in items:
+            all_instrs.extend(self._resolve(item))
+
+        # Valida che le colonne esistano
+        for instr in all_instrs:
+            for col in instr.column_names:
+                if col not in df.columns:
+                    raise ValueError(f"Column '{col}' not found in DataFrame")
+
+        # ── 5. Partiziona per pannello ─────────────────────────────────────
+        price_instrs     = [i for i in all_instrs if i.panel == 'price']
+        indicator_instrs = [i for i in all_instrs if i.panel != 'price']
+
+        # ── 6. Crea subplots ───────────────────────────────────────────────
+        n_ind  = len(indicator_instrs)
+        n_rows = 1 + n_ind
         if title is None:
             chart_name = "Candlestick" if chart_type == 'candlestick' else "Price"
             title = f"{plot_ticker} - {chart_name} and Indicators"
-        
-        # Create subplots with appropriate configuration
-        if has_indicator_panel:
-            # Calculate row heights: Price: 50%, Indicators: 50% (split equally)
-            price_height = 0.5
-            indicator_total = 0.5
-            indicator_height = indicator_total / n_indicator_panels if n_indicator_panels > 0 else 0
-            
-            row_heights = [price_height]
-            row_heights.extend([indicator_height] * n_indicator_panels)
-            
-            # Build specs: price panel has secondary y-axis, indicator panels don't
-            specs = [[{"secondary_y": True}]]  # Price panel
-            specs.extend([[{"secondary_y": False}]] * n_indicator_panels)  # Indicator panels
-            
-            # Build subplot titles
-            subplot_titles = [title]
-            for factor_info in indicator_panel_factors:
-                # Use first column name or base name for title
-                title_name = factor_info['column_names'][0]
-                # Remove suffix like '_upper', '_lower', '_middle' for cleaner title
-                if '_' in title_name:
-                    base_name = '_'.join(title_name.split('_')[:-1])
-                    if base_name:
-                        title_name = base_name
-                subplot_titles.append(title_name)
-            
+
+        if n_ind > 0:
+            row_heights = [0.5] + [0.5 / n_ind] * n_ind
+            specs       = [[{"secondary_y": True}]] + [[{"secondary_y": False}]] * n_ind
+            sub_titles  = [title] + [i.label or i.column_names[0] for i in indicator_instrs]
             fig = make_subplots(
                 rows=n_rows, cols=1,
                 shared_xaxes=True,
                 vertical_spacing=0.05,
                 row_heights=row_heights,
                 specs=specs,
-                subplot_titles=subplot_titles
+                subplot_titles=sub_titles,
             )
         else:
             fig = make_subplots(
                 rows=1, cols=1,
                 specs=[[{"secondary_y": True}]],
-                subplot_titles=[title]
+                subplot_titles=[title],
             )
-        
-        # Get time data
-        time_data = df_filtered.select(pl.col(self.time_col)).to_series()
-        
-        # Plot price (line or candlestick)
+
+        # ── 7. Trace del prezzo ────────────────────────────────────────────
         if chart_type == 'line':
-            close_data = df_filtered.select(pl.col('close')).to_series()
-            fig.add_trace(
-                go.Scatter(
-                    x=time_data,
-                    y=close_data,
-                    name='Close',
-                    line=dict(color='#2E86AB', width=2),
-                    mode='lines'
-                ),
-                row=1, col=1,
-                secondary_y=False
-            )
-        else:  # candlestick
-            open_data = df_filtered.select(pl.col('open')).to_series()
-            high_data = df_filtered.select(pl.col('high')).to_series()
-            low_data = df_filtered.select(pl.col('low')).to_series()
-            close_data = df_filtered.select(pl.col('close')).to_series()
-            
-            fig.add_trace(
-                go.Candlestick(
-                    x=time_data,
-                    open=open_data,
-                    high=high_data,
-                    low=low_data,
-                    close=close_data,
-                    name='OHLC',
-                    increasing_line_color='#26A69A',  # Green for up candles
-                    decreasing_line_color='#EF5350',  # Red for down candles
-                    xaxis='x',
-                    yaxis='y'
-                ),
-                row=1, col=1,
-                secondary_y=False
-            )
-            
-            # Explicitly disable rangeslider for candlestick charts
+            fig.add_trace(go.Scatter(
+                x=time_data, y=df.select(pl.col('close')).to_series(),
+                name='Close', line=dict(color='#2E86AB', width=2), mode='lines',
+            ), row=1, col=1, secondary_y=False)
+        else:
+            fig.add_trace(go.Candlestick(
+                x=time_data,
+                open=df.select(pl.col('open')).to_series(),
+                high=df.select(pl.col('high')).to_series(),
+                low=df.select(pl.col('low')).to_series(),
+                close=df.select(pl.col('close')).to_series(),
+                name='OHLC',
+                increasing_line_color='#26A69A',
+                decreasing_line_color='#EF5350',
+            ), row=1, col=1, secondary_y=False)
             fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
-        
-        # Plot factors in price panel
-        for factor_info in price_panel_factors:
-            self._add_factor_traces(fig, time_data, factor_info, row=1, df_filtered=df_filtered)
-        
-        # Plot each indicator factor in its own panel (starting from row 2)
-        for idx, factor_info in enumerate(indicator_panel_factors):
-            self._add_factor_traces(fig, time_data, factor_info, row=2 + idx, df_filtered=df_filtered)
-        
-        # Update layout
+
+        # ── 8. Trace degli indicatori ──────────────────────────────────────
+        for instr in price_instrs:
+            self._render(fig, df, time_data, instr, row=1)
+        for idx, instr in enumerate(indicator_instrs):
+            self._render(fig, df, time_data, instr, row=2 + idx)
+
+        # ── 8b. Linee EOD ──────────────────────────────────────────────────
+        if show_eod:
+            self._render_eod_lines(fig, df, n_rows)
+
+        # ── 9. Layout ──────────────────────────────────────────────────────
         fig.update_layout(
-            template=theme,
-            height=height,
-            width=width,
-            hovermode='x unified',
-            showlegend=True,
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1
-            )
+            template=theme, height=height, width=width,
+            hovermode='x unified', showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        
-        # Update x-axes
-        # Disable rangeslider on all rows, especially important for candlestick charts
+        rangebreaks = self._get_rangebreaks(df)
         for row in range(1, n_rows + 1):
             fig.update_xaxes(
                 rangeslider=dict(visible=False),
                 type='date',
-                row=row, col=1
+                rangebreaks=rangebreaks or None,
+                row=row, col=1,
             )
-        
-        # Update y-axes labels
         fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
-        
-        # Update y-axis labels for each indicator panel
-        for idx, factor_info in enumerate(indicator_panel_factors):
-            # Use first column name for y-axis label
-            y_label = factor_info['column_names'][0]
-            # Clean up label (remove suffixes for cleaner display)
-            if '_' in y_label:
-                base_name = '_'.join(y_label.split('_')[:-1])
-                if base_name:
-                    y_label = base_name
-            fig.update_yaxes(title_text=y_label, row=2 + idx, col=1)
-        
-        return fig
-    
-    def _parse_factor(self, factor: Union[str, 'Factor']) -> dict:
-        """
-        Parse a factor (string or Factor object) into plotting configuration.
-        
-        For Factor objects, extracts plot configuration and handles multi-column factors
-        (like DonchianChannels which has upper, lower, middle columns).
-        
-        Returns:
-        --------
-        dict with keys: column_names (list), panel, color, line_style, line_width, opacity, show_in_legend
-        """
-        if isinstance(factor, str):
-            # String factor name - use defaults
-            return {
-                'column_names': [factor],  # Single column
-                'panel': 'price',  # Default to price panel for string names
-                'color': None,  # Will be auto-assigned
-                'line_style': 'solid',
-                'line_width': 1.5,
-                'opacity': 0.8,
-                'show_in_legend': True
-            }
-        else:
-            # Factor object - extract configuration
-            plot_cfg = factor.plot_config
-            column_names = factor.get_column_names()
-            
-            return {
-                'column_names': column_names,  # Can be multiple columns
-                'panel': plot_cfg.panel,
-                'color': plot_cfg.color,
-                'line_style': plot_cfg.line_style,
-                'line_width': plot_cfg.line_width,
-                'opacity': plot_cfg.opacity,
-                'show_in_legend': plot_cfg.show_in_legend
-            }
-    
-    def _add_factor_traces(
-        self, 
-        fig: go.Figure, 
-        time_data: pl.Series, 
-        factor_info: dict, 
-        row: int,
-        df_filtered: pl.DataFrame
-    ):
-        """
-        Add factor trace(s) to the figure. Handles both single-column and multi-column factors.
-        
-        Parameters:
-        -----------
-        fig : go.Figure
-            The plotly figure to add trace to
-        time_data : pl.Series
-            Time series data for x-axis
-        factor_info : dict
-            Factor configuration dictionary from _parse_factor
-        row : int
-            Subplot row number
-        df_filtered : pl.DataFrame
-            Filtered DataFrame for the specific ticker
-        """
-        column_names = factor_info['column_names']
-        base_color = factor_info['color']
-        
-        # Map line style names to plotly dash values
-        dash_map = {
-            'solid': 'solid',
-            'dash': 'dash',
-            'dot': 'dot',
-            'dashdot': 'dashdot'
-        }
-        
-        # Color palette for multi-column factors (e.g., DonchianChannels)
-        multi_colors = {
-            'upper': '#26A69A',  # Green/teal for upper
-            'lower': '#EF5350',  # Red for lower
-            'middle': '#FFA726'  # Orange for middle
-        }
-        
-        # For each column in the factor
-        for col_name in column_names:
-            # Get factor data from filtered dataframe
-            factor_data = df_filtered.select(pl.col(col_name)).to_series()
-            
-            # Determine color
-            color = base_color
-            if color is None:
-                # For multi-column factors, use specific colors
-                if len(column_names) > 1:
-                    # Extract suffix (upper, lower, middle)
-                    if '_upper' in col_name:
-                        color = multi_colors['upper']
-                    elif '_lower' in col_name:
-                        color = multi_colors['lower']
-                    elif '_middle' in col_name:
-                        color = multi_colors['middle']
-                    else:
-                        # Fallback: use hash for consistent assignment
-                        color_idx = hash(col_name) % 8
-                        colors = ['#A23B72', '#F18F01', '#C73E1D', '#6A994E', 
-                                 '#BC4B51', '#5E548E', '#E07A5F', '#3D5A80']
-                        color = colors[color_idx]
-                else:
-                    # Single column: use hash for consistent color assignment
-                    color_idx = hash(col_name) % 8
-                    colors = ['#A23B72', '#F18F01', '#C73E1D', '#6A994E', 
-                             '#BC4B51', '#5E548E', '#E07A5F', '#3D5A80']
-                    color = colors[color_idx]
-            
-            # Create trace
-            trace = go.Scatter(
-                x=time_data,
-                y=factor_data,
-                name=col_name,
-                line=dict(
-                    color=color,
-                    width=factor_info['line_width'],
-                    dash=dash_map.get(factor_info['line_style'], 'solid')
-                ),
-                mode='lines',
-                opacity=factor_info['opacity'],
-                showlegend=factor_info['show_in_legend']
+        for idx, instr in enumerate(indicator_instrs):
+            fig.update_yaxes(
+                title_text=instr.label or instr.column_names[0],
+                row=2 + idx, col=1,
             )
-            
-            # Add trace to appropriate subplot
-            if row == 1:
-                # Price panel - use primary y-axis
-                fig.add_trace(trace, row=row, col=1, secondary_y=False)
-            else:
-                # Indicator panel - no secondary y-axis
-                fig.add_trace(trace, row=row, col=1)
-    
+
+        return fig
+
+    # ──────────────────────────────────────────────────────────────────────
+    # EOD vertical lines
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _render_eod_lines(
+        self,
+        fig: go.Figure,
+        df: pl.DataFrame,
+        n_rows: int,
+        color: str = 'rgba(90,90,90,0.65)',
+        width: int = 1,
+        dash: str = 'dashdot',
+    ) -> None:
+        """
+        Aggiunge una linea verticale alla prima barra di ogni giornata (= inizio sessione).
+
+        Funziona solo con dati intraday (time_col == 'timestamp').
+        La linea è posizionata sulla prima barra di ogni giornata (tranne la prima),
+        coerentemente con lo standard dei chart finanziari professionali.
+        """
+        if self.time_col != 'timestamp' or 'date' not in df.columns:
+            return
+
+        # Prima barra di ogni giornata = inizio nuova sessione
+        eod_times = (
+            df.group_by('date')
+            .agg(pl.col('timestamp').min().alias('eod_ts'))
+            .sort('date')
+            .slice(1)  # salta il primo giorno (non ha sessione precedente)
+        )
+
+        for ts in eod_times['eod_ts'].to_list():
+            for row in range(1, n_rows + 1):
+                yref = 'y domain' if row == 1 else f'y{row} domain'
+                fig.add_shape(
+                    type='line',
+                    xref='x', yref=yref,
+                    x0=ts, x1=ts,
+                    y0=0, y1=1,
+                    line=dict(color=color, width=width, dash=dash),
+                    row=row, col=1,
+                )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Range breaks per intraday
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _get_rangebreaks(self, df_filtered: pl.DataFrame) -> list:
+        """
+        Compute Plotly rangebreaks to hide non-trading periods in intraday charts.
+        
+        For intraday data (time_col == 'timestamp') automatically removes:
+        - Weekend gaps (Saturday–Monday)
+        - Overnight gaps (market close → market open next day)
+        
+        Trading hours are inferred from the actual times present in the data.
+        
+        Returns an empty list for EOD (daily) data.
+        """
+        if self.time_col != 'timestamp':
+            return []  # EOD data – no rangebreaks needed
+
+        rangebreaks = []
+
+        # 1. Remove weekends
+        rangebreaks.append(dict(bounds=["sat", "mon"]))
+
+        # 2. Remove overnight gaps using trading hours derived from the data
+        if 'time' in df_filtered.columns:
+            open_t = df_filtered['time'].min()   # earliest bar start time
+            close_t = df_filtered['time'].max()  # latest bar start time
+
+            if open_t is not None and close_t is not None:
+                open_hour  = open_t.hour  + open_t.minute  / 60.0
+                close_hour = close_t.hour + close_t.minute / 60.0
+
+                # Estimate bar duration to push the break past the last bar's end
+                times_sorted = df_filtered['time'].unique().sort()
+                if len(times_sorted) >= 2:
+                    t0 = times_sorted[0]
+                    t1 = times_sorted[1]
+                    bar_minutes = (t1.hour * 60 + t1.minute) - (t0.hour * 60 + t0.minute)
+                    close_hour += bar_minutes / 60.0
+
+                # Only add overnight break when market doesn't run 24h
+                if open_hour > 0 or close_hour < 23.5:
+                    rangebreaks.append(dict(bounds=[close_hour, open_hour], pattern="hour"))
+
+        return rangebreaks
+
     def _should_use_secondary_axis(self, price_data: pl.Series, indicator_data: pl.Series) -> bool:
         """
         Determine if an indicator should be plotted on secondary y-axis.
@@ -486,36 +671,19 @@ class Plotter:
     
     def plot_candlestick(
         self,
-        ticker: Optional[str] = None,
+        ticker:       Optional[str]  = None,
         plot_factors: Optional[List[Union[str, 'Factor']]] = None,
-        title: Optional[str] = None,
-        height: int = 600,
-        width: Optional[int] = None,
-        theme: str = 'plotly_white'
+        title:        Optional[str]  = None,
+        height:       int            = 600,
+        width:        Optional[int]  = None,
+        theme:        str            = 'plotly_white',
+        start_date:   Optional[str]  = None,
+        end_date:     Optional[str]  = None,
+        show_eod:     bool           = False,
     ) -> go.Figure:
         """
         Convenience method to create candlestick chart.
         Wrapper around plot() with chart_type='candlestick'.
-        
-        Parameters:
-        -----------
-        ticker : str, optional
-            Specific ticker to plot
-        plot_factors : List[Union[str, Factor]], optional
-            List of indicators to plot
-        title : str, optional
-            Chart title
-        height : int, default=600
-            Height of the plot
-        width : int, optional
-            Width of the plot
-        theme : str, default='plotly_white'
-            Plotly theme
-        
-        Returns:
-        --------
-        go.Figure
-            Plotly figure with candlestick chart
         """
         return self.plot(
             ticker=ticker,
@@ -524,7 +692,10 @@ class Plotter:
             height=height,
             width=width,
             chart_type='candlestick',
-            theme=theme
+            theme=theme,
+            start_date=start_date,
+            end_date=end_date,
+            show_eod=show_eod,
         )
 
 
@@ -537,7 +708,10 @@ def plot_timeseries(
     height: int = 600,
     width: Optional[int] = None,
     chart_type: str = 'line',
-    theme: str = 'plotly_white'
+    theme: str = 'plotly_white',
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    show_eod: bool = False,
 ) -> go.Figure:
     """
     Convenience function to quickly plot financial time series data.
@@ -600,7 +774,10 @@ def plot_timeseries(
         height=height,
         width=width,
         chart_type=chart_type,
-        theme=theme
+        theme=theme,
+        start_date=start_date,
+        end_date=end_date,
+        show_eod=show_eod,
     )
 
 

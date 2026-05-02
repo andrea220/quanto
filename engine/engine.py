@@ -103,6 +103,22 @@ class Researcher:
         # self._data_cache = df
         return df
     
+    @property
+    def factor_registry(self) -> Dict[str, Factor]:
+        """
+        Restituisce un dizionario ``{nome_o_colonna: Factor}`` per tutti i factor.
+
+        Ogni factor è accessibile sia tramite il suo nome (es. ``"pdl"``,  ``"ms_5"``)
+        che tramite ognuna delle colonne che produce (es. ``"pdl_hod_top"``).
+        Utile per il ``Plotter._resolve()`` e per ispezioni manuali.
+        """
+        registry: Dict[str, Factor] = {}
+        for f in self.factors:
+            registry[f.name] = f
+            for col in f.get_column_names():
+                registry[col] = f
+        return registry
+
     def get_data_eod(self) -> Optional[pl.DataFrame]:
        
         # Load all data at once
@@ -118,13 +134,16 @@ class Researcher:
         return df
     def plot(
         self,
-        ticker: Optional[str] = None,
+        ticker:       Optional[str]  = None,
         plot_factors: Optional[List] = None,
-        title: Optional[str] = None,
-        height: int = 600,
-        width: Optional[int] = None,
-        chart_type: str = 'line',
-        theme: str = 'plotly_white'
+        title:        Optional[str]  = None,
+        height:       int            = 600,
+        width:        Optional[int]  = None,
+        chart_type:   str            = 'line',
+        theme:        str            = 'plotly_white',
+        start_date:   Optional[str]  = None,
+        end_date:     Optional[str]  = None,
+        show_eod:     bool           = False,
     ):
         """
         Create an interactive plot with price data and factors.
@@ -149,6 +168,13 @@ class Researcher:
             Type of price chart: 'line' for line chart, 'candlestick' for OHLC candlestick chart
         theme : str, default='plotly_white'
             Plotly template theme
+        start_date : str, optional
+            Data di inizio del range da plottare (es. '2026-01-15')
+        end_date : str, optional
+            Data di fine del range da plottare (es. '2026-03-31')
+        show_eod : bool, default=False
+            Se True aggiunge una linea verticale alla fine di ogni giornata
+            (solo per dati intraday)
         
         Returns:
         --------
@@ -161,8 +187,10 @@ class Researcher:
         >>> fig = researcher.plot()
         >>> fig.show()
         >>> 
-        >>> # Plot specific ticker with candlestick
-        >>> fig = researcher.plot(ticker='SX5E', chart_type='candlestick')
+        >>> # Plot specific ticker with candlestick, filtered range and EOD lines
+        >>> fig = researcher.plot(ticker='SX5E', chart_type='candlestick',
+        ...                       start_date='2026-03-01', end_date='2026-03-15',
+        ...                       show_eod=True)
         >>> fig.show()
         """
         from engine.plotting import Plotter
@@ -175,7 +203,10 @@ class Researcher:
             height=height,
             width=width,
             chart_type=chart_type,
-            theme=theme
+            theme=theme,
+            start_date=start_date,
+            end_date=end_date,
+            show_eod=show_eod,
         )
 
 class Strategy(ABC):
@@ -276,6 +307,8 @@ class Strategy(ABC):
                  reporter: Optional[ReportWriter] = None):
         
         self.starting_balance = starting_balance
+        self.start_date = start_date
+        self.end_date = end_date
         self.balance = pl.DataFrame(schema={"date": pl.Date, "time": pl.Time, "balance": pl.Float64})
         self.feed = feed
         exec_model_temp = exec_model or ExecutionModel(mode="on_close")

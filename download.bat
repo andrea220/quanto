@@ -9,7 +9,8 @@ REM Cambia directory al percorso dello script
 cd /d "%~dp0"
 
 REM Attiva il virtual environment
-call C:\Documenti\quantenv\Scripts\activate.bat
+@REM call C:\Documenti\quantenv\Scripts\activate.bat
+call C:\dev\quanto\venv\Scripts\activate.bat
 
 REM Chiedi all'utente di inserire un ticker
 set /p user_input="Inserisci il ticker: "

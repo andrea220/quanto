@@ -512,6 +512,288 @@ class StrategyAnalytics:
             "Profit Factor": format_value(self.profit_factor()),
             "Max Drawdown": format_value(self.max_drawdown()),
         }
+
+    # ── Excel export ──────────────────────────────────────────────────────────
+
+    def _build_closed_trades(self) -> pd.DataFrame:
+        """Restituisce un DataFrame con una riga per trade chiuso, arricchita di statistiche.
+
+        Nota: quando is_alive==False la quantity è 0 (posizione già chiusa), quindi
+        entry_price e quantity vengono presi dall'ultimo snapshot is_alive==True.
+        """
+        if self.trades_df.empty:
+            return pd.DataFrame()
+
+        alive = self.trades_df[self.trades_df['is_alive'] == True]
+        dead  = self.trades_df[self.trades_df['is_alive'] == False]
+
+        if dead.empty:
+            return pd.DataFrame()
+
+        # Ultimo snapshot aperto → contiene entry_price e quantity corretti
+        entry_info = (
+            alive.sort_values('ref_date')
+                 .groupby('trade_id', as_index=False)
+                 .last()
+            [['trade_id', 'symbol', 'side', 'entry_time', 'quantity', 'entry_price']]
+        )
+
+        # Primo snapshot chiuso → contiene closed_pnl e commissions definitivi
+        exit_info = (
+            dead.sort_values('ref_date')
+                .groupby('trade_id', as_index=False)
+                .first()
+            [['trade_id', 'ref_date', 'closed_pnl', 'commissions']]
+        )
+
+        merged = entry_info.merge(exit_info, on='trade_id', how='inner')
+
+        # Stima del prezzo di uscita:
+        # realized_pnl = (exit_price - entry_price) * pos_type * qty - exit_costs
+        # Per semplificare (long, commissions≈0): exit_price ≈ entry_price + closed_pnl / qty
+        qty = merged['quantity'].replace(0, np.nan)
+        merged['exit_price'] = merged['entry_price'] + merged['closed_pnl'] / qty
+
+        # Return % sul notional di entrata
+        merged['return_pct'] = (merged['closed_pnl'] / (merged['entry_price'] * qty)) * 100
+
+        cols = {
+            'trade_id':    'Trade ID',
+            'symbol':      'Symbol',
+            'side':        'Side',
+            'entry_time':  'Entry Time',
+            'ref_date':    'Exit Date',
+            'quantity':    'Qty',
+            'entry_price': 'Entry Price',
+            'exit_price':  'Exit Price',
+            'closed_pnl':  'Realized PnL',
+            'commissions': 'Commissions',
+            'return_pct':  'Return %',
+        }
+        available = {k: v for k, v in cols.items() if k in merged.columns}
+        return merged[list(available.keys())].rename(columns=available)
+
+    def export_excel(self, path: str = None, strategy_name: str = None) -> str:
+        """
+        Esporta un report Excel del backtest con più fogli:
+
+        - **Summary**      : metriche di performance aggregate
+        - **Equity Curve** : equity giornaliera
+        - **Closed Trades**: lista trade chiusi con statistiche
+        - **Open Trades**  : posizioni ancora aperte (se presenti)
+
+        Parameters
+        ----------
+        path : str, optional
+            Percorso del file .xlsx. Default: ``backtest_report_<strategy_name>.xlsx``
+        strategy_name : str, optional
+            Nome da usare nel titolo e nel nome file. Default: classe della strategia.
+
+        Returns
+        -------
+        str
+            Percorso assoluto del file generato.
+        """
+        import xlsxwriter  # noqa: F401 – assicura che sia disponibile
+
+        sname = strategy_name or self.strategy.__class__.__name__
+        if path is None:
+            path = f"backtest_report_{sname}.xlsx"
+
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+        closed_trades = self._build_closed_trades()
+        summary_dict  = self.summary()
+
+        with pd.ExcelWriter(path, engine="xlsxwriter",
+                            engine_kwargs={"options": {"nan_inf_to_errors": True}}) as writer:
+            wb = writer.book
+
+            # ── Formati comuni ────────────────────────────────────────────
+            fmt_title = wb.add_format({
+                'bold': True, 'font_size': 14, 'font_color': '#FFFFFF',
+                'bg_color': '#1F4E79', 'border': 0,
+            })
+            fmt_header = wb.add_format({
+                'bold': True, 'font_color': '#FFFFFF',
+                'bg_color': '#2E75B6', 'border': 1,
+                'border_color': '#BDD7EE', 'align': 'center', 'valign': 'vcenter',
+            })
+            fmt_label = wb.add_format({
+                'bold': True, 'bg_color': '#D6E4F0',
+                'border': 1, 'border_color': '#BDD7EE',
+            })
+            fmt_value = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'num_format': '0.000000',
+            })
+            fmt_int = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'num_format': '0',
+            })
+            fmt_date = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'num_format': 'yyyy-mm-dd',
+            })
+            fmt_money = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'num_format': '#,##0.00',
+            })
+            fmt_pct = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'num_format': '0.00"%"',
+            })
+            fmt_pos = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'num_format': '#,##0.00',
+                'font_color': '#1F7A1F',
+            })
+            fmt_neg = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'num_format': '#,##0.00',
+                'font_color': '#C00000',
+            })
+            fmt_row_even = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'bg_color': '#EBF3FB',
+            })
+            fmt_row_odd  = wb.add_format({
+                'border': 1, 'border_color': '#BDD7EE', 'bg_color': '#FFFFFF',
+            })
+
+            # ── Helper: scrive un DataFrame con header colorato ───────────
+            def write_df(ws, df: pd.DataFrame, start_row: int, start_col: int = 0):
+                """Scrive df nel worksheet, ritorna la riga successiva all'ultima dati."""
+                # Header
+                for ci, col in enumerate(df.columns):
+                    ws.write(start_row, start_col + ci, col, fmt_header)
+                ws.set_row(start_row, 18)
+
+                money_cols = {'Realized PnL', 'Unrealized PnL', 'Commissions',
+                              'Entry Price', 'Exit Price', 'Current Value',
+                              'daily_equity', 'Equity'}
+                pct_cols   = {'Return %', 'Unrealized %'}
+                date_cols  = {'Exit Date', 'ref_date', 'Date'}
+                int_cols   = {'Trade ID', 'Qty'}
+
+                for ri, (_, row) in enumerate(df.iterrows()):
+                    row_fmt = fmt_row_even if ri % 2 == 0 else fmt_row_odd
+                    ws.set_row(start_row + 1 + ri, 16)
+                    for ci, col in enumerate(df.columns):
+                        val = row[col]
+                        # scegli formato
+                        if col in pct_cols:
+                            f = fmt_pct
+                        elif col in date_cols:
+                            f = fmt_date
+                        elif col in int_cols:
+                            f = fmt_int
+                        elif col in money_cols:
+                            f = fmt_money
+                        elif col == 'Realized PnL':
+                            f = fmt_pos if (isinstance(val, (int, float)) and val >= 0) else fmt_neg
+                        else:
+                            f = row_fmt
+                        ws.write(start_row + 1 + ri, start_col + ci, val, f)
+
+                return start_row + 1 + len(df) + 1  # riga libera dopo la tabella
+
+            # ════════════════════════════════════════════════════════════
+            # Foglio 1 – SUMMARY
+            # ════════════════════════════════════════════════════════════
+            ws_sum = wb.add_worksheet("Summary")
+            ws_sum.set_column(0, 0, 28)
+            ws_sum.set_column(1, 1, 20)
+
+            # Titolo
+            ws_sum.merge_range('A1:B1', f'Backtest Report – {sname}', fmt_title)
+            ws_sum.set_row(0, 24)
+
+            # Parametri strategia
+            params = [
+                ('Start Date',        str(getattr(self.strategy, 'start_date',  'N/A'))),
+                ('End Date',          str(getattr(self.strategy, 'end_date',    'N/A'))),
+                ('Starting Balance',  getattr(self.strategy, 'starting_balance', 'N/A')),
+                ('Final Balance',     round(self.strategy.starting_balance + self.trades_df['global_pnl'].sum()
+                                           if not self.trades_df.empty else self.strategy.starting_balance, 2)),
+                ('Total P&L',         round(self.trades_df['global_pnl'].sum()
+                                           if not self.trades_df.empty else 0.0, 2)),
+            ]
+            row = 2
+            for label, val in params:
+                ws_sum.write(row, 0, label, fmt_label)
+                if isinstance(val, float):
+                    ws_sum.write(row, 1, val, fmt_money)
+                else:
+                    ws_sum.write(row, 1, val, fmt_value)
+                row += 1
+
+            row += 1  # riga vuota
+            ws_sum.write(row, 0, 'Metric', fmt_header)
+            ws_sum.write(row, 1, 'Value',  fmt_header)
+            row += 1
+
+            int_metrics = {'N. Trade'}
+            for metric, val in summary_dict.items():
+                ws_sum.write(row, 0, metric, fmt_label)
+                if metric in int_metrics:
+                    ws_sum.write(row, 1, val, fmt_int)
+                elif isinstance(val, str) and val != 'N/A':
+                    try:
+                        ws_sum.write(row, 1, float(val), fmt_value)
+                    except ValueError:
+                        ws_sum.write(row, 1, val, fmt_value)
+                else:
+                    ws_sum.write(row, 1, val, fmt_value)
+                row += 1
+
+            # ════════════════════════════════════════════════════════════
+            # Foglio 2 – EQUITY CURVE (giornaliera)
+            # ════════════════════════════════════════════════════════════
+            ws_eq = wb.add_worksheet("Equity Curve")
+            ws_eq.set_column(0, 0, 18)
+            ws_eq.set_column(1, 1, 18)
+
+            ws_eq.merge_range('A1:B1', 'Equity Curve', fmt_title)
+            ws_eq.set_row(0, 24)
+
+            if not self.daily_equity.empty:
+                eq_df = self.daily_equity[['ref_date', 'daily_equity']].copy()
+                eq_df = eq_df.rename(columns={'ref_date': 'Date', 'daily_equity': 'Equity'})
+                # Groupby giornaliero: ultimo valore del giorno (gestisce sia EOD che intraday)
+                eq_df['Date'] = pd.to_datetime(eq_df['Date']).dt.date
+                eq_df = (eq_df.groupby('Date', as_index=False)
+                               .last()
+                               .sort_values('Date')
+                               .reset_index(drop=True))
+                write_df(ws_eq, eq_df, start_row=2)
+
+            # ════════════════════════════════════════════════════════════
+            # Foglio 3 – CLOSED TRADES
+            # ════════════════════════════════════════════════════════════
+            ws_ct = wb.add_worksheet("Closed Trades")
+            ws_ct.set_column(0, 0, 10)   # Trade ID
+            ws_ct.set_column(1, 1, 10)   # Symbol
+            ws_ct.set_column(2, 2, 8)    # Side
+            ws_ct.set_column(3, 3, 22)   # Entry Time
+            ws_ct.set_column(4, 4, 14)   # Exit Date
+            ws_ct.set_column(5, 5, 8)    # Qty
+            ws_ct.set_column(6, 7, 14)   # Entry/Exit Price
+            ws_ct.set_column(8, 10, 14)  # PnL cols
+
+            ws_ct.merge_range(0, 0, 0, 10, 'Closed Trades', fmt_title)
+            ws_ct.set_row(0, 24)
+
+            if not closed_trades.empty:
+                next_row = write_df(ws_ct, closed_trades, start_row=2)
+
+                # Riga di riepilogo totali
+                ws_ct.write(next_row, 0, 'TOTALS', fmt_label)
+                pnl_col_idx = list(closed_trades.columns).index('Realized PnL') if 'Realized PnL' in closed_trades.columns else None
+                if pnl_col_idx is not None:
+                    total_pnl = closed_trades['Realized PnL'].sum()
+                    f = fmt_pos if total_pnl >= 0 else fmt_neg
+                    ws_ct.write(next_row, pnl_col_idx, total_pnl, f)
+
+                comm_col_idx = list(closed_trades.columns).index('Commissions') if 'Commissions' in closed_trades.columns else None
+                if comm_col_idx is not None:
+                    ws_ct.write(next_row, comm_col_idx, closed_trades['Commissions'].sum(), fmt_money)
+
+
+        print(f"[OK] Report Excel salvato in: {os.path.abspath(path)}")
+        return os.path.abspath(path)
     
 @dataclass
 class ReportWriter:
