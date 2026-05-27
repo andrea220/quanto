@@ -39,7 +39,7 @@ class Researcher:
         end_date : str
             End date for data loading (format: YYYY-MM-DD)
         frequency : str
-            Data frequency (e.g., '1d', '1h', '1m')
+            Data frequency. Valid values: "eod", "1m", "5m", "1h", "4h"
         tickers : List[str]
             List of ticker symbols to load
         """
@@ -100,7 +100,7 @@ class Researcher:
                 df = df.slice(first_valid_idx, df.height - first_valid_idx)
         
         # Cache the result
-        # self._data_cache = df
+        self._data_cache = df
         return df
     
     @property
@@ -120,18 +120,28 @@ class Researcher:
         return registry
 
     def get_data_eod(self) -> Optional[pl.DataFrame]:
-       
-        # Load all data at once
+        """Load raw EOD bars for all tickers, without factor computation.
+
+        This method always loads end-of-day data regardless of the frequency
+        configured on the Researcher. It is intentionally separate from get_data()
+        and is used by backtest_refactor to provide the previous day's EOD context
+        alongside higher-frequency intraday data.
+
+        Returns:
+            pl.DataFrame with raw EOD bars, or None if no data is available.
+            Unlike get_data(), the result is NOT cached and factors are NOT computed.
+        """
         df = self.feed.scan_prices(
-            self.start_date, 
-            self.end_date, 
-            'eod', 
+            self.start_date,
+            self.end_date,
+            'eod',
             self.tickers
         ).collect(engine="streaming")
-        
+
         if df.height == 0:
             return None
         return df
+
     def plot(
         self,
         ticker:       Optional[str]  = None,

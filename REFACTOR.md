@@ -67,9 +67,9 @@ Legenda severità: 🔴 CRITICO — blocca funzionamento o produce risultati sco
 |---|----------|----------|
 | E1 | **Due path di backtest** (`backtest` vs `backtest_refactor`): nessuna è dichiarata canonica, le strategie usano `backtest_refactor` ma `backtest` rimane nel codice, crea confusione sul contratto della `Strategy` ABC. | 🔴 |
 | E2 | **`PositionType` importato due volte** — da `execution` e da `portfolio`; il secondo shadowing il primo. Fonte: duplicazione dell'enum. | 🟡 |
-| E3 | **Caching `Researcher.get_data` disabilitato** — la riga `# self._data_cache = df` è commentata; il docstring afferma che il cache esiste; ogni chiamata ricalcola tutti i fattori. | 🟡 |
+| ~~E3~~ | ~~**Caching `Researcher.get_data` disabilitato** — la riga `# self._data_cache = df` è commentata; il docstring afferma che il cache esiste; ogni chiamata ricalcola tutti i fattori.~~ **Cache riabilitato: `self._data_cache = df` decommentato.** | ~~🟡~~ ✅ |
 | E4 | **`RiskManager` salvato ma mai chiamato** — `self.risk` è istanziato in `on_start` ma nessun punto del loop di backtest lo invoca; i risk check non avvengono mai. | 🟡 |
-| E5 | **`get_data_eod` ignora `self.frequency`** — carica sempre `'eod'` a prescindere dalla frequenza configurata sul `Researcher`. | ⚪ |
+| ~~E5~~ | ~~**`get_data_eod` ignora `self.frequency`** — carica sempre `'eod'` a prescindere dalla frequenza configurata sul `Researcher`.~~ **Comportamento intenzionale documentato: aggiunto docstring esplicito che chiarisce lo scopo separato del metodo (EOD context per `backtest_refactor`).** | ~~⚪~~ ✅ |
 | E6 | **`positions_summary` concat ogni barra** — accumulo `O(N²)` in memoria; scala male su backtest lunghi. | ⚪ |
 
 ---
@@ -118,10 +118,10 @@ Legenda severità: 🔴 CRITICO — blocca funzionamento o produce risultati sco
 
 | # | Problema | Severità |
 |---|----------|----------|
-| F1 | **Nessun supporto labeling (t0/t1)** — i fattori producono segnali ma non espongono l'intervallo evento `[t0, t1]` necessario per Purged CV, sample weights e meta-labeling (BR-5). Gap architetturale rispetto a tutte le fasi analitiche avanzate. | 🔴 |
+| ~~F1~~ | ~~**Nessun supporto labeling (t0/t1)** — i fattori producono segnali ma non espongono l'intervallo evento `[t0, t1]` necessario per Purged CV, sample weights e meta-labeling (BR-5).~~ **Hook `t1_offset() -> Optional[int]` aggiunto al Factor ABC; creato `engine/labeling.py` con `FixedHorizonLabeler` (preview di D3). `SignalExitLabeler` rimane in Blocco D.** | ~~🔴~~ ✅ |
 | F2 | **Loop NumPy per-ticker in `BuySellLiquidity`, `MarketStructure`, `PrevDayHighLow`** — corretto ma non scalabile; su universe ampi o backtest lunghi il bottleneck è in Python. | 🟡 |
-| F3 | **Lookahead non documentato uniformemente** — alcuni fattori usano `shift(-n)` per la conferma dei pivot (corretto in research ma richiede lag esplicito in backtest); il contratto "quante barre di lag devo aggiungere" non è uniforme tra fattori. | 🟡 |
-| F4 | **Firma `compute` astratta inconsistente** — il tipo annotato varia tra implementazioni (`market_data` vs `pl.DataFrame`). | ⚪ |
+| ~~F3~~ | ~~**Lookahead non documentato uniformemente** — alcuni fattori usano `shift(-n)` per la conferma dei pivot (corretto in research ma richiede lag esplicito in backtest); il contratto "quante barre di lag devo aggiungere" non è uniforme tra fattori.~~ **Aggiunto warning ⚠️ esplicito in `MarketStructure` (allineato a quello già presente in `SwingHighLow`).** | ~~🟡~~ ✅ |
+| ~~F4~~ | ~~**Firma `compute` astratta inconsistente** — il tipo annotato varia tra implementazioni (`market_data` vs `pl.DataFrame`).~~ **ABC e `MovingAverage` allineati: `compute(self, market_data: pl.DataFrame) -> pl.DataFrame`.** | ~~⚪~~ ✅ |
 
 ---
 
@@ -129,9 +129,9 @@ Legenda severità: 🔴 CRITICO — blocca funzionamento o produce risultati sco
 
 | # | Problema | Severità |
 |---|----------|----------|
-| D1 | **`get_bar` usa calendario globale cross-ticker** — "N barre fa" è calcolato sul set unione di `(date, time)` di tutti i ticker; su dataset multi-ticker con barre mancanti si perde la corrispondenza per-ticker. | 🟡 |
-| D2 | **Semantica offset negativo non ovvia** — un offset negativo in `price()`/`get()` avanza nel futuro invece di tornare indietro; controintuitivo e non documentato chiaramente. | ⚪ |
-| D3 | **Commenti misto italiano/inglese** — riduce leggibilità del codice. | ⚪ |
+| ~~D1~~ | ~~**`get_bar` usa calendario globale cross-ticker** — "N barre fa" è calcolato sul set unione di `(date, time)` di tutti i ticker; su dataset multi-ticker con barre mancanti si perde la corrispondenza per-ticker.~~ **Documentato nel docstring di `get_bar()` con nota esplicita sul comportamento e sulle implicazioni multi-ticker.** | ~~🟡~~ ✅ |
+| ~~D2~~ | ~~**Semantica offset negativo non ovvia** — un offset negativo in `price()`/`get()` avanza nel futuro invece di tornare indietro; controintuitivo e non documentato chiaramente.~~ **Aggiunto `allow_lookahead: bool = False` su `MarketData`: offset negativo solleva `ValueError` per default; warning esplicito nei docstring.** | ~~⚪~~ ✅ |
+| ~~D3~~ | ~~**Commenti misto italiano/inglese** — riduce leggibilità del codice.~~ **Tutti i commenti inline tradotti in inglese.** | ~~⚪~~ ✅ |
 
 ---
 

@@ -1,24 +1,26 @@
 {
-  "SX5E": {
-    "ib_ticker": null,
-    "bbg_ticker": "SX5E Index",
-    "name": "EUROSTOXX 50",
-    "exchange": null,
-    "currency": "EUR",
-    "asset_type": "Index",
-    "country": "EU",
-    "sector": null,
-    "industry": null
+  "AAPL": {
+    "bbg_ticker": null,
+    "ib_ticker": "AAPL",
+    "name": "APPLE INC",
+    "exchange": "NASDAQ",
+    "currency": "USD",
+    "asset_type": "STK",
+    "country": "US",
+    "sector": "Computers",
+    "industry": "Technology",
+    "last_updated": "2026-05-26"
   },
   "SPY": {
-    "ib_ticker": null,
-    "bbg_ticker": "SPY US Equity",
-    "name": "S&P500 ETF",
-    "exchange": "NYSE ARCA",
+    "bbg_ticker": null,
+    "ib_ticker": "SPY",
+    "name": "SS SPDR S&P 500 ETF TRUST-US",
+    "exchange": "ARCA",
     "currency": "USD",
-    "asset_type": "ETF",
+    "asset_type": "STK",
     "country": "US",
     "sector": null,
-    "industry": null
+    "industry": null,
+    "last_updated": "2026-05-26"
   }
 }

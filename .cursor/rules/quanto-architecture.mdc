@@ -17,6 +17,7 @@ alwaysApply: false
 | `execution.py` | `ExecutionModel`, `Order`, `Fill`, `OrderType` |
 | `risk.py` | `RiskManager` |
 | `reports.py` | `ReportWriter` (logging) |
+| `labeling.py` | `FixedHorizonLabeler` — labels signal events with [t0, t1] and forward return y |
 
 ## Data
 
@@ -62,6 +63,9 @@ class MyFactor(Factor):
     def warmup(self) -> int:
         return self.window
 
+    def t1_offset(self) -> Optional[int]:  # override to declare natural event horizon
+        return None  # None = no natural horizon; caller must supply it to FixedHorizonLabeler
+
     def get_column_names(self) -> List[str]:        # override if multi-column output
         return [self.name]
 
@@ -102,6 +106,20 @@ researcher.plot(plot_factors=[
 `MovingAverage`, `Return`, `Momentum`, `DonchianChannels`, `ATR`,
 `SwingHighLow`, `FairValueGap`, `OrderBlock`, `BuySellLiquidity`,
 `MarketStructure`, `PrevDayHighLow`
+
+## Labeling (engine/labeling.py)
+
+```python
+from engine.labeling import FixedHorizonLabeler
+
+labeler = FixedHorizonLabeler(horizon=5, signal_col="ms_1_signal")
+events = labeler.label(df).drop_nulls("y")
+# events columns: t0_date, t1_date, ticker, signal, price_t0, price_t1, y, holding_time
+```
+
+- `y = (price_t1 / price_t0 - 1) * sign(signal)` — signed forward return
+- Rows with `t1` beyond series end have `null` y — drop with `.drop_nulls("y")`
+- Output is input for sample weights and Purged K-Fold CV (Blocco D/E)
 
 ## TODO – to be detailed
 

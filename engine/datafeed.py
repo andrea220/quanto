@@ -130,7 +130,7 @@ class DataFeed:
         for t in tickers:
             paths += self._price_paths(t, start_date, end_date)
         if not paths:
-            # <<< schema minimo atteso dal resto della pipeline
+            # Minimal schema expected by the rest of the pipeline
             schema = {
                 "date": pl.Date,
                 "time": pl.Time,
@@ -143,7 +143,7 @@ class DataFeed:
                 "insertion_time": pl.Datetime(time_unit="us", time_zone=None),
                 "type": pl.Utf8,
             }
-            return pl.DataFrame(schema=schema).lazy()  # LazyFrame con colonne note (vuoto)
+            return pl.DataFrame(schema=schema).lazy()  # Empty LazyFrame with the known schema
 
         lf = pl.scan_parquet(paths).filter(
             (pl.col("date").cast(pl.Date) >= pl.lit(start_date).cast(pl.Date)) &
@@ -297,10 +297,16 @@ class MarketData:
             Required columns: date, time, ticker, open, high, low, close, volume
         current_timestamp: Tuple (date, time) representing the current bar.
             If None, uses the last row in the DataFrame as current.
+        allow_lookahead: If False (default), raises ValueError when a negative integer
+            offset is used in price(), get(), or get_bar(), preventing accidental
+            lookahead bias in backtests. Set to True in research contexts where
+            forward-looking access (e.g. computing forward returns for labeling)
+            is intentional.
         _ticker_cache: Internal cache for filtered ticker data (performance optimization)
     """
     data: pl.DataFrame
     current_timestamp: Optional[tuple] = None
+    allow_lookahead: bool = False
     _ticker_cache: Dict[str, pl.DataFrame] = field(default_factory=dict, repr=False)
     
     def __post_init__(self):
@@ -373,7 +379,9 @@ class MarketData:
             offset: Time offset or slice:
                 - None or 0: Current price (at current_timestamp)
                 - Positive int (1, 2, ...): Price N bars ago (T-N)
-                - Negative int (-1, -2, ...): Price N bars ahead (T+N, if available)
+                - Negative int (-1, -2, ...): Price N bars AHEAD (T+N, future lookahead).
+                    WARNING: using a negative offset in a backtest loop introduces
+                    lookahead bias — only use it intentionally in research contexts.
                 - slice(None, N) or :N: Last N prices up to current (inclusive)
                 - slice(M, N): Prices from T-N+1 to T-M (M < N, both relative to current)
                 - slice(-N, None): Last N prices (alternative syntax)
@@ -388,7 +396,7 @@ class MarketData:
             >>> market_data.price("SPY", "close")
             450.25
             
-            >>> # Price 1 bar ago
+            >>> # Price 1 bar ago (T-1)
             >>> market_data.price("SPY", "close", 1)
             449.80
             
@@ -420,7 +428,13 @@ class MarketData:
             return float(ticker_data[price_type][current_idx])
         
         elif isinstance(offset, int):
-            # Integer offset: T-1, T-2, T+1, etc.
+            # Negative offset = future lookahead
+            if offset < 0 and not self.allow_lookahead:
+                raise ValueError(
+                    f"Negative offset ({offset}) accesses future bars and introduces "
+                    "lookahead bias. Set allow_lookahead=True on MarketData to allow "
+                    "this in research contexts."
+                )
             target_idx = current_idx - offset
             if target_idx < 0 or target_idx >= ticker_data.height:
                 return None
@@ -517,7 +531,9 @@ class MarketData:
             offset: Time offset or slice:
                 - None or 0: Current row (at current_timestamp)
                 - Positive int (1, 2, ...): Row N bars ago (T-N)
-                - Negative int (-1, -2, ...): Row N bars ahead (T+N, if available)
+                - Negative int (-1, -2, ...): Row N bars AHEAD (T+N, future lookahead).
+                    WARNING: using a negative offset in a backtest loop introduces
+                    lookahead bias — only use it intentionally in research contexts.
                 - slice(None, N) or :N: Last N rows up to current (inclusive)
                 - slice(M, N): Rows from T-N+1 to T-M (M < N, both relative to current)
         
@@ -555,7 +571,13 @@ class MarketData:
             return ticker_data.slice(current_idx, 1)
         
         elif isinstance(offset, int):
-            # Integer offset: T-1, T-2, T+1, etc.
+            # Negative offset = future lookahead
+            if offset < 0 and not self.allow_lookahead:
+                raise ValueError(
+                    f"Negative offset ({offset}) accesses future bars and introduces "
+                    "lookahead bias. Set allow_lookahead=True on MarketData to allow "
+                    "this in research contexts."
+                )
             target_idx = current_idx - offset
             if target_idx < 0 or target_idx >= ticker_data.height:
                 return None
@@ -644,28 +666,48 @@ class MarketData:
         This method is similar to get() but works on all tickers without requiring
         a ticker parameter. It returns all tickers at a specific bar offset from
         the current timestamp.
+
+        Note — cross-ticker calendar (multi-ticker datasets):
+            The bar offset is computed on the UNION of all (date, time) timestamps
+            present across all tickers. This means "N bars ago" refers to the N-th
+            most recent timestamp in the combined timeline, not per-ticker.
+            Consequence: if tickers have different bar schedules (e.g. one ticker
+            has a missing bar), the returned DataFrame may contain only a subset of
+            tickers for that timestamp. For offset access with per-ticker semantics,
+            use get() on each ticker individually.
         
         Args:
             index: Time offset:
                 - None or 0: Current bar (at current_timestamp)
-                - Positive int (1, 2, ...): Bar N bars ago (T-N)
-                - Negative int (-1, -2, ...): Bar N bars ahead (T+N, if available)
+                - Positive int (1, 2, ...): Bar N bars ago (T-N) in the global timeline
+                - Negative int (-1, -2, ...): Bar N bars AHEAD (T+N, future lookahead).
+                    WARNING: using a negative index in a backtest loop introduces
+                    lookahead bias — only use it intentionally in research contexts.
         
         Returns:
-            DataFrame with all tickers at the specified bar, or None if offset out of range
+            DataFrame with all tickers at the specified bar, or None if offset out of range.
+            May contain fewer tickers than expected when bars are missing for some symbols.
         
         Examples:
             >>> # Current bar for all tickers
             >>> market_data.get_bar()
             <polars.DataFrame with all tickers at current timestamp>
             
-            >>> # Bar 10 bars ago (T-10)
+            >>> # Bar 10 bars ago (T-10) in the global timeline
             >>> market_data.get_bar(10)
             <polars.DataFrame with all tickers at T-10>
         """
         # Handle offset
         if index is None:
             return self.get_current_bar()
+
+        # Negative index = future lookahead
+        if index < 0 and not self.allow_lookahead:
+            raise ValueError(
+                f"Negative index ({index}) accesses future bars and introduces "
+                "lookahead bias. Set allow_lookahead=True on MarketData to allow "
+                "this in research contexts."
+            )
                
         # Get unique timestamps sorted chronologically
         unique_timestamps = self.data.select(["date", "time"]).unique().sort(["date", "time"])
@@ -728,19 +770,23 @@ class MarketData:
         self._ticker_cache.clear()
     
     @classmethod
-    def from_dataframe(cls, df: pl.DataFrame, 
-                      current_timestamp: Optional[tuple] = None) -> "MarketData":
+    def from_dataframe(cls, df: pl.DataFrame,
+                      current_timestamp: Optional[tuple] = None,
+                      allow_lookahead: bool = False) -> "MarketData":
         """
         Create MarketData from historical DataFrame.
         
         Args:
             df: DataFrame with columns: date, time, ticker, open, high, low, close, volume
             current_timestamp: Tuple (date, time) for current bar. If None, uses last row.
+            allow_lookahead: If False (default), raises ValueError on negative offsets to
+                prevent accidental lookahead bias. Set True in research contexts.
         
         Returns:
             MarketData instance
         """
-        return cls(data=df, current_timestamp=current_timestamp)
+        return cls(data=df, current_timestamp=current_timestamp,
+                   allow_lookahead=allow_lookahead)
     
     @classmethod
     def from_datafeed(
@@ -750,7 +796,8 @@ class MarketData:
         end_date: str,
         frequency: Literal["1m", "5m", "1h", "4h", "eod"],
         tickers: List[str],
-        current_timestamp: Optional[tuple] = None
+        current_timestamp: Optional[tuple] = None,
+        allow_lookahead: bool = False,
     ) -> "MarketData":
         """
         Create MarketData from DataFeed I/O loader.
@@ -762,10 +809,13 @@ class MarketData:
             frequency: "eod" for end-of-day or "1m", "5m", "1h", "4h" for intraday data
             tickers: List of ticker symbols to load
             current_timestamp: Tuple (date, time) for current bar. If None, uses last row.
+            allow_lookahead: If False (default), raises ValueError on negative offsets to
+                prevent accidental lookahead bias. Set True in research contexts.
         
         Returns:
             MarketData instance with historical data loaded from DataFeed
         """
         df = feed.get_market_data(start_date, end_date, frequency, tickers)
-        return cls.from_dataframe(df, current_timestamp=current_timestamp)
+        return cls.from_dataframe(df, current_timestamp=current_timestamp,
+                                  allow_lookahead=allow_lookahead)
 

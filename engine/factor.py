@@ -161,13 +161,29 @@ class Factor(ABC):
         pass
     
     @abstractmethod
-    def compute(self, market_data):
-        return
+    def compute(self, market_data: pl.DataFrame) -> pl.DataFrame:
+        """Compute the factor and return a new DataFrame with added columns."""
+        pass
     
     @abstractmethod
     def warmup(self):
         return
     
+    def t1_offset(self) -> Optional[int]:
+        """Return the natural event horizon for this factor in bars.
+
+        Used by the labeling framework (FixedHorizonLabeler / SignalExitLabeler)
+        to pair a signal at t0 with its event end t1. When a factor has a natural
+        holding horizon (e.g. a trend-following factor with a fixed exit rule),
+        override this method to declare it.
+
+        Returns:
+            Number of bars from signal generation (t0) to event end (t1),
+            or None if the factor does not define a natural event horizon.
+            None is the default — the caller must supply the horizon explicitly.
+        """
+        return None
+
     def get_column_names(self) -> List[str]:
         """Return ALL column names produced by this factor.
         
@@ -255,7 +271,7 @@ class MovingAverage(Factor):
             name_parts.append("ema")
         return "_".join(name_parts)
 
-    def compute(self, market_data):
+    def compute(self, market_data: pl.DataFrame) -> pl.DataFrame:
         if self.ma_type == "simple":
             expr = pl.col(self.field).rolling_mean(window_size=self.window)
         else:  # exponential
@@ -1037,6 +1053,11 @@ class MarketStructure(Factor):
         * trend era rialzista      → MSS bear (segnale = -2)
 
     Implementazione: Python loop per ticker (non vectorizzata).
+
+    ⚠️  Il rilevamento dei pivot usa lookahead sul lato destro (highs[i + j])
+        per confermare la formazione dello swing, identico a SwingHighLow.
+        Questo è corretto per ricerca/visualizzazione.
+        In backtest, leggi il segnale con market_data.get(ticker, swing_window).
 
     Colonne prodotte
     ----------------

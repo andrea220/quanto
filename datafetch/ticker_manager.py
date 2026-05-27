@@ -97,6 +97,41 @@ class TickerManager:
             temp_path.replace(self.universe_path)
             logger.debug(f"Saved ticker universe to {self.universe_path}")
     
+    def create_anag(self, ticker: str) -> None:
+        """
+        Create a skeleton entry in anag.json for a ticker.
+
+        All fields are set to null. Fill in bbg_ticker (and other fields)
+        manually in config/anag.json before running the downloader.
+
+        Args:
+            ticker: Primary ticker symbol (key in universe, e.g. 'SX5E')
+
+        Raises:
+            ValueError: If the ticker already exists in the universe
+        """
+        ticker = ticker.upper().strip()
+
+        universe = self.load_universe()
+        if ticker in universe:
+            raise ValueError(f"Ticker '{ticker}' already exists in anag.json")
+
+        ticker_data = {
+            "bbg_ticker": None,
+            "ib_ticker": ticker,
+            "name": None,
+            "exchange": None,
+            "currency": None,
+            "asset_type": None,
+            "country": None,
+            "sector": None,
+            "industry": None,
+        }
+
+        universe[ticker] = ticker_data
+        self.save_universe(universe)
+        logger.info(f"Created skeleton anag entry for '{ticker}'")
+
     def add_ticker(
         self,
         ticker: str,
